@@ -18,7 +18,33 @@
   "min_interval_per_host": 3.0,
   "log_level": "INFO",
 
+  // 단가 기반 딜 평가. "12,900원"이 아니라 "개당 645원, 30일 중앙값 대비 29% 저렴"
+  // 을 계산한다. 가격 이력은 필터와 무관하게 전부 쌓인다 — 토스 딜만 모아서는
+  // 비교 기준이 생기지 않기 때문이다.
+  "pricing": {
+    "enabled": true,
+    "db_path": "prices.db",
+    "window_days": 30,
+    // 표본이 이보다 적으면 등급을 매기지 않는다. 낮추면 오판이 급증한다.
+    "min_samples": 5,
+    "super_deal_ratio": 0.70,   // 중앙값의 70% 이하 → 초특가
+    "good_deal_ratio": 0.85,    // 85% 이하 → 특가
+    "below_average_ratio": 1.00,
+    "retention_days": 180
+  },
+
   "sources": [
+    // ── 토스 앱 (안드로이드 기기가 수집해 브리지로 밀어넣은 것을 읽는다) ──
+    // tools/toss_capture.py 또는 알림 캡처가 POST /ingest 로 넣는다.
+    // 자세한 절차는 docs/toss-capture.md 참고.
+    {
+      "name": "토스핫딜",
+      "type": "ingest",
+      "url": "http://127.0.0.1:8080",
+      "token": "${BRIDGE_TOKEN}",
+      "enabled": false,
+      "max_items": 50
+    },
     {
       "name": "뽐뿌",
       "type": "rss",
@@ -80,6 +106,13 @@
     "require_all_keywords": false,
     "min_price_krw": null,
     "max_price_krw": null,
+
+    // 단가 등급 하한. "" / "평균이하" / "특가" / "초특가"
+    // "초특가"로 두면 방이 아주 조용해진다. 처음엔 ""로 두고 며칠 관찰할 것.
+    "min_grade": "",
+    // 단가를 못 구했거나 비교 표본이 부족한 딜을 통과시킬지.
+    // false 로 두면 처음 보는 상품은 절대 안 나간다 — 놓치는 딜이 많아진다.
+    "allow_ungraded": true,
 
     // 이 시간보다 오래된 글은 무시한다. 게시 시각을 못 얻은 글은 통과시킨다.
     "max_age_minutes": 180

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from . import senders as sender_registry
 from . import sources as source_registry
@@ -21,11 +21,21 @@ from .config import Config
 from .filters import DealFilter
 from .http import DEFAULT_USER_AGENT, HttpClient
 from .models import Deal
+from .price_store import Grade, PriceStore, PricingSettings
 from .senders.base import Sender
 from .sources.base import SourceError
 from .store import DealStore
 
 log = logging.getLogger(__name__)
+
+
+# min_grade 비교용 서열. 위가 더 좋은 딜이다.
+_GRADE_RANK = {
+    Grade.SUPER: 3,
+    Grade.GOOD: 2,
+    Grade.BELOW_AVERAGE: 1,
+    Grade.NORMAL: 0,
+}
 
 
 @dataclass(slots=True)
@@ -34,6 +44,8 @@ class RunReport:
     after_filter: int = 0
     new_deals: int = 0
     sent_messages: int = 0
+    priced: int = 0
+    graded: dict[str, int] = field(default_factory=dict)
     seeded: bool = False
     source_errors: dict[str, str] = field(default_factory=dict)
     sender_errors: dict[str, str] = field(default_factory=dict)
@@ -47,6 +59,10 @@ class RunReport:
         ]
         if self.seeded:
             parts.append("(최초 실행: 발송 없이 기준선만 기록)")
+        if self.priced:
+            parts.append(f"가격기록 {self.priced}")
+        if self.graded:
+            parts.append("등급 " + ", ".join(f"{k} {v}" for k, v in sorted(self.graded.items())))
         if self.source_errors:
             parts.append(f"소스오류 {len(self.source_errors)}")
         if self.sender_errors:
@@ -55,7 +71,7 @@ class RunReport:
 
 
 class Pipeline:
-    def __init__(self, config: Config, *, store: DealStore | None = None) -> None:
+    def __init__(self, config: Config, *, store: DealStore | None = None, prices: PriceStore | None = None) -> None:
         self.config = config
         self.client = HttpClient(
             user_agent=config.user_agent or DEFAULT_USER_AGENT,
@@ -63,6 +79,18 @@ class Pipeline:
             min_interval_per_host=config.min_interval_per_host,
         )
         self.store = store or DealStore(config.db_path)
+        self.prices = prices or PriceStore(
+            config.pricing.db_path,
+            PricingSettings(
+                enabled=config.pricing.enabled,
+                window_days=config.pricing.window_days,
+                min_samples=config.pricing.min_samples,
+                super_deal_ratio=config.pricing.super_deal_ratio,
+                good_deal_ratio=config.pricing.good_deal_ratio,
+                below_average_ratio=config.pricing.below_average_ratio,
+                retention_days=config.pricing.retention_days,
+            ),
+        )
         self.filter = DealFilter(config.filters)
         self.sources = [source_registry.build(item, self.client) for item in config.enabled_sources]
         self.senders: list[Sender] = [sender_registry.build(item, self.client) for item in config.enabled_senders]
@@ -89,6 +117,35 @@ class Pipeline:
             log.info("[%s] %d건 수집", source.name, len(fetched))
             deals.extend(fetched)
         return deals
+
+    def _grade(self, deals: list[Deal], report: RunReport) -> list[Deal]:
+        """단가를 판정해 표시 문구를 붙이고, min_grade 미만은 걸러낸다."""
+        if not self.config.pricing.enabled:
+            return deals
+
+        minimum = self.config.filters.min_grade
+        allow_ungraded = self.config.filters.allow_ungraded
+        kept: list[Deal] = []
+
+        for deal in deals:
+            verdict = self.prices.evaluate(deal)
+            report.graded[verdict.grade.value] = report.graded.get(verdict.grade.value, 0) + 1
+
+            if minimum:
+                rank = _GRADE_RANK.get(verdict.grade)
+                if rank is None:
+                    # 등급을 매길 수 없는 딜 (단가 불명 / 표본 부족)
+                    if not allow_ungraded:
+                        log.debug("등급 미판정으로 제외: %s", deal.title)
+                        continue
+                elif rank < _GRADE_RANK[Grade(minimum)]:
+                    log.debug("등급 미달(%s < %s)로 제외: %s", verdict.grade.value, minimum, deal.title)
+                    continue
+
+            note = verdict.describe()
+            kept.append(replace(deal, note=note) if note else deal)
+
+        return kept
 
     def _dispatch(self, deals: list[Deal], report: RunReport) -> list[Deal]:
         """모든 어댑터로 보내고, 최소 한 곳에는 전달된 딜만 돌려준다.
@@ -136,6 +193,11 @@ class Pipeline:
             )
             return report
 
+        # 가격 이력은 필터와 무관하게 전부 기록한다.
+        # 토스 딜만 모아서는 "평소보다 싸다"를 판단할 기준이 생기지 않는다.
+        if self.config.pricing.enabled and not dry_run:
+            report.priced = self.prices.record_many(collected)
+
         passed: list[Deal] = []
         rejected: list[Deal] = []
         for deal in collected:
@@ -147,6 +209,7 @@ class Pipeline:
             self.store.mark_many(rejected)
 
         fresh = [deal for deal in passed if self.store.is_new(deal)]
+        fresh = self._grade(fresh, report)
         report.new_deals = len(fresh)
         if not fresh:
             return report
@@ -189,6 +252,9 @@ class Pipeline:
                 removed = self.store.prune(self.config.dedup_retention_days)
                 if removed:
                     log.info("오래된 중복제거 기록 %d건 정리", removed)
+                removed = self.prices.prune()
+                if removed:
+                    log.info("오래된 가격 이력 %d건 정리", removed)
                 last_prune = now
 
             elapsed = time.monotonic() - started
@@ -196,3 +262,4 @@ class Pipeline:
 
     def close(self) -> None:
         self.store.close()
+        self.prices.close()

@@ -52,12 +52,12 @@ class HttpClient:
 
     # ---------- 공개 API ----------
 
-    def get_text(self, url: str) -> str:
-        body, charset = self._get(url)
+    def get_text(self, url: str, headers: dict[str, str] | None = None) -> str:
+        body, charset = self._get(url, headers)
         return body.decode(charset, errors="replace")
 
-    def get_bytes(self, url: str) -> bytes:
-        body, _ = self._get(url)
+    def get_bytes(self, url: str, headers: dict[str, str] | None = None) -> bytes:
+        body, _ = self._get(url, headers)
         return body
 
     def post_json(self, url: str, payload: bytes, headers: dict[str, str] | None = None) -> bytes:
@@ -71,7 +71,7 @@ class HttpClient:
 
     # ---------- 내부 ----------
 
-    def _get(self, url: str) -> tuple[bytes, str]:
+    def _get(self, url: str, headers: dict[str, str] | None = None) -> tuple[bytes, str]:
         if self.respect_robots and not self._robots_allows(url):
             raise RobotsDisallowed(f"robots.txt 가 접근을 금지합니다: {url}")
 
@@ -79,6 +79,8 @@ class HttpClient:
         request.add_header("User-Agent", self.user_agent)
         request.add_header("Accept-Encoding", "gzip, deflate")
         request.add_header("Accept-Language", "ko-KR,ko;q=0.9,en;q=0.5")
+        for key, value in (headers or {}).items():
+            request.add_header(key, value)
         header_charset: list[str] = []
         body = self._send_with_retry(request, url, header_charset)
         return body, detect_charset(body, header_charset[0] if header_charset else "")

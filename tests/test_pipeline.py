@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from hotdeal.config import from_dict
 from hotdeal.models import Deal
 from hotdeal.pipeline import Pipeline
+from hotdeal.price_store import PriceStore
 from hotdeal.senders.base import SendError, Sender
 from hotdeal.sources.base import Source, SourceError
 from hotdeal.store import DealStore
@@ -58,7 +59,8 @@ class FakeSender(Sender):
 def make_pipeline(deals, *, senders=None, sources=None, **overrides):
     config = from_dict({**BASE, **overrides})
     config.db_path = ":memory:"
-    pipeline = Pipeline(config, store=DealStore(":memory:"))
+    config.pricing.db_path = ":memory:"
+    pipeline = Pipeline(config, store=DealStore(":memory:"), prices=PriceStore(":memory:"))
     pipeline.sources = sources if sources is not None else [FakeSource(deals)]
     pipeline.senders = senders if senders is not None else [FakeSender()]
     return pipeline
@@ -244,3 +246,78 @@ class BatchingTest(unittest.TestCase):
         pipeline.run_once()
         self.assertEqual(len(sender.sent), 2)
         self.assertEqual(pipeline.store.count(), 6)
+
+
+class GradingTest(unittest.TestCase):
+    """단가 판정이 파이프라인에 붙는지, min_grade 로 걸러지는지."""
+
+    @staticmethod
+    def _history_deals():
+        from datetime import timedelta
+
+        now = datetime.now(timezone.utc)
+        rows = [("신라면 20개입 18,000원", 18000, 25), ("신라면 20개입 17,800원", 17800, 20),
+                ("신라면 20개입 19,000원", 19000, 15), ("신라면 20개입 18,400원", 18400, 10),
+                ("신라면 20개입 17,900원", 17900, 5), ("신라면 10개입 9,200원", 9200, 3)]
+        return [
+            Deal("fake", title, f"https://a.example/h{index}", posted_at=now - timedelta(days=ago), price_krw=price)
+            for index, (title, price, ago) in enumerate(rows)
+        ]
+
+    def _pipeline(self, deals, **overrides):
+        prices = PriceStore(":memory:")
+        for item in self._history_deals():
+            prices.record(item)
+        config = from_dict({**BASE, **overrides})
+        config.db_path = ":memory:"
+        config.pricing.db_path = ":memory:"
+        config.pricing.min_samples = 5
+        pipeline = Pipeline(config, store=DealStore(":memory:"), prices=prices)
+        self.sender = FakeSender()
+        pipeline.sources = [FakeSource(deals)]
+        pipeline.senders = [self.sender]
+        return pipeline
+
+    def test_verdict_is_attached_to_the_message(self):
+        cheap = Deal("fake", "[쿠팡] 농심 신라면 20개입 12,900원", "https://a.example/x",
+                     posted_at=datetime.now(timezone.utc), price_krw=12900)
+        self._pipeline([cheap], seed_on_first_run=False).run_once()
+        self.assertIn("645원/개", self.sender.sent[0])
+        self.assertIn("중앙값", self.sender.sent[0])
+
+    def test_min_grade_drops_ordinary_deals(self):
+        expensive = Deal("fake", "[쿠팡] 신라면 20개입 22,000원", "https://a.example/y",
+                         posted_at=datetime.now(timezone.utc), price_krw=22000)
+        cheap = Deal("fake", "[쿠팡] 신라면 20개입 12,900원", "https://a.example/z",
+                     posted_at=datetime.now(timezone.utc), price_krw=12900)
+        pipeline = self._pipeline([expensive, cheap], seed_on_first_run=False,
+                                  filters={"max_age_minutes": None, "min_grade": "특가"})
+        pipeline.run_once()
+        self.assertEqual(len(self.sender.sent), 1)
+        self.assertIn("12,900", self.sender.sent[0])
+
+    def test_ungraded_deal_passes_when_allowed(self):
+        unknown = Deal("fake", "에어팟 프로 2세대 289,000원", "https://a.example/u",
+                       posted_at=datetime.now(timezone.utc), price_krw=289000)
+        pipeline = self._pipeline([unknown], seed_on_first_run=False,
+                                  filters={"max_age_minutes": None, "min_grade": "특가", "allow_ungraded": True})
+        pipeline.run_once()
+        self.assertEqual(len(self.sender.sent), 1)
+
+    def test_ungraded_deal_dropped_when_not_allowed(self):
+        unknown = Deal("fake", "에어팟 프로 2세대 289,000원", "https://a.example/u",
+                       posted_at=datetime.now(timezone.utc), price_krw=289000)
+        pipeline = self._pipeline([unknown], seed_on_first_run=False,
+                                  filters={"max_age_minutes": None, "min_grade": "특가", "allow_ungraded": False})
+        pipeline.run_once()
+        self.assertEqual(self.sender.sent, [])
+
+    def test_history_records_deals_that_failed_the_filter(self):
+        # 토스 딜만 기록하면 비교 기준이 영원히 안 쌓인다.
+        unrelated = Deal("fake", "[쿠팡] 진라면 30개입 15,000원", "https://a.example/w",
+                         posted_at=datetime.now(timezone.utc), price_krw=15000)
+        pipeline = self._pipeline([unrelated], seed_on_first_run=False,
+                                  filters={"include_keywords": ["토스"], "max_age_minutes": None})
+        report = pipeline.run_once()
+        self.assertEqual(report.after_filter, 0)
+        self.assertEqual(report.priced, 1)

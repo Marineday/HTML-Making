@@ -25,6 +25,11 @@ def _clip(text: str, limit: int = MAX_TITLE_CHARS) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+def _link_line(deal: Deal) -> str:
+    """웹 링크가 없는 딜(토스 앱 카드)에 가짜 링크를 보여주면 안 된다."""
+    return deal.url if deal.has_web_link else "토스 앱 → 홈 → 핫딜 에서 확인"
+
+
 def _price_line(deal: Deal) -> str | None:
     if deal.price_krw is None:
         return None
@@ -42,20 +47,26 @@ def format_deal(deal: Deal, style: Style = "plain", *, prefix: str = "🔥") -> 
         lines = [head, f"<i>{html_mod.escape(deal.source)}</i>"]
         if price:
             lines.append(html_mod.escape(price))
-        lines.append(html_mod.escape(deal.url))
+        if deal.note:
+            lines.append(html_mod.escape(deal.note))
+        lines.append(html_mod.escape(_link_line(deal)))
         return "\n".join(lines)
 
     if style == "markdown":
         lines = [f"{prefix} **{title}**", f"_{deal.source}_"]
         if price:
             lines.append(price)
-        lines.append(deal.url)
+        if deal.note:
+            lines.append(deal.note)
+        lines.append(_link_line(deal))
         return "\n".join(lines)
 
     lines = [f"{prefix} {title}", f"📍 {deal.source}"]
     if price:
         lines.append(price)
-    lines.append(f"🔗 {deal.url}")
+    if deal.note:
+        lines.append(f"📊 {deal.note}")
+    lines.append(f"🔗 {_link_line(deal)}")
     return "\n".join(lines)
 
 

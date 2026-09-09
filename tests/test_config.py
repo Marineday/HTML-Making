@@ -78,3 +78,36 @@ class ConfigTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CommentStrippingTest(unittest.TestCase):
+    """// 주석은 지우되 문자열 안의 // 는 건드리면 안 된다."""
+
+    def test_full_line_comment_removed(self):
+        self.assertEqual(config_module.strip_comments('// 주석\n{"a":1}').strip(), '{"a":1}')
+
+    def test_trailing_comment_removed(self):
+        self.assertEqual(config_module.strip_comments('{"a":1} // 뒤 주석').strip(), '{"a":1}')
+
+    def test_url_inside_string_survives(self):
+        # 단순 치환이었다면 "http: 로 잘려 나간다.
+        source = '{"url": "https://a.example/x"}'
+        self.assertEqual(config_module.strip_comments(source), source)
+
+    def test_comment_after_url_is_removed(self):
+        result = config_module.strip_comments('{"url": "https://a.example/x"} // 설명')
+        self.assertIn("https://a.example/x", result)
+        self.assertNotIn("설명", result)
+
+    def test_escaped_quote_does_not_end_the_string(self):
+        source = r'{"a": "he said \"//no\"", "b": 1}'
+        self.assertEqual(config_module.strip_comments(source), source)
+
+    def test_line_numbers_are_preserved_for_error_messages(self):
+        text = '{\n// 주석\n"a":1}'
+        self.assertEqual(text.count("\n"), config_module.strip_comments(text).count("\n"))
+
+    def test_example_config_has_trailing_comments_and_urls(self):
+        raw = Path("config.example.json").read_text(encoding="utf-8")
+        self.assertIn("//", raw)
+        self.assertIn("https://", config_module.strip_comments(raw))

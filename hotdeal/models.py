@@ -86,6 +86,8 @@ class Deal:
     price_krw: int | None = None
     shop: str | None = None
     category: str | None = None
+    #: 가격 판정 결과 등 표시용 부가 정보. 중복제거 키에는 영향을 주지 않는다.
+    note: str = field(default="", compare=False)
     extra: dict[str, str] = field(default_factory=dict, compare=False)
 
     def __post_init__(self) -> None:
@@ -93,6 +95,23 @@ class Deal:
             raise ValueError("Deal.title 은 비어 있을 수 없습니다")
         if not self.url.strip():
             raise ValueError("Deal.url 은 비어 있을 수 없습니다")
+
+    #: 웹 링크가 없는 딜(토스 앱 카드 등)에 붙이는 접두사.
+    PSEUDO_SCHEME = "app-deal://"
+
+    @staticmethod
+    def pseudo_url(namespace: str, title: str) -> str:
+        """웹 URL 이 없는 딜에 안정적인 중복제거 키를 만들어준다.
+
+        제목이 같으면 항상 같은 값이 나오므로, 화면을 다시 읽어도 같은 딜로
+        인식된다. 포매터는 이 접두사를 보고 링크 대신 안내 문구를 낸다.
+        """
+        digest = hashlib.sha1(title.strip().encode("utf-8")).hexdigest()[:16]
+        return f"{Deal.PSEUDO_SCHEME}{namespace}/{digest}"
+
+    @property
+    def has_web_link(self) -> bool:
+        return not self.url.startswith(self.PSEUDO_SCHEME)
 
     @property
     def normalized_url(self) -> str:

@@ -10,10 +10,22 @@
     실제 카톡 전송에 성공한 뒤 ack 를 받아야 삭제한다. 임대가 만료되면 다시
     대기 상태로 돌아간다 — 최소 1회 전달(at-least-once)이다.
 
-엔드포인트
+엔드포인트 (나가는 메시지)
     POST /enqueue   {"room": "...", "text": "..."}         → {"ok":true,"id":N}
     GET  /pull?room=...&max=5                              → {"ok":true,"messages":[{"id":N,"text":"..."}]}
     POST /ack       {"ids": [1,2,3]}                       → {"ok":true,"acked":N}
+
+엔드포인트 (들어오는 딜)
+    POST /ingest    {"source":"toss", "deals":[{...}]}     → {"ok":true,"accepted":N}
+    GET  /inbox?limit=50                                   → {"ok":true,"deals":[{...}]}
+
+    안드로이드 기기에서 수집한 딜을 밀어넣는 통로다. UI 덤프 스크립트든
+    알림 캡처(Tasker/MacroDroid)든 같은 엔드포인트를 쓴다.
+
+    inbox 는 소비되지 않는 롤링 버퍼다. 읽어도 지워지지 않는다 —
+    파이프라인이 이미 지문 기반 중복제거를 하므로 같은 딜을 여러 번 읽어도
+    안전하고, 대신 파이프라인이 죽어도 딜이 유실되지 않는다.
+
     GET  /health                                           → {"ok":true,...}
 
 인증
@@ -24,6 +36,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import json
 import logging
@@ -52,7 +65,19 @@ CREATE TABLE IF NOT EXISTS outbox (
     delivered_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(room, delivered_at, leased_until);
+
+CREATE TABLE IF NOT EXISTS inbox (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    dedup_key   TEXT NOT NULL UNIQUE,
+    source      TEXT NOT NULL,
+    payload     TEXT NOT NULL,
+    received_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_inbox_received ON inbox(received_at);
 """
+
+MAX_INBOX_ROWS = 2000
+MAX_INGEST_DEALS = 200
 
 
 class Queue:
@@ -116,11 +141,50 @@ class Queue:
             self._conn.commit()
             return cursor.rowcount
 
+    # ---------- 들어오는 딜 ----------
+
+    def ingest(self, source: str, deals: list[dict]) -> int:
+        """딜을 인박스에 넣는다. 이미 있는 것은 건너뛰고 새로 들어간 수를 반환."""
+        now = time.time()
+        accepted = 0
+        with self._lock:
+            for deal in deals:
+                key = _inbox_key(source, deal)
+                cursor = self._conn.execute(
+                    "INSERT OR IGNORE INTO inbox (dedup_key, source, payload, received_at) VALUES (?, ?, ?, ?)",
+                    (key, source, json.dumps(deal, ensure_ascii=False), now),
+                )
+                accepted += cursor.rowcount
+            # 버퍼가 무한히 자라지 않도록 오래된 것부터 잘라낸다.
+            self._conn.execute(
+                "DELETE FROM inbox WHERE id NOT IN (SELECT id FROM inbox ORDER BY id DESC LIMIT ?)",
+                (MAX_INBOX_ROWS,),
+            )
+            self._conn.commit()
+        return accepted
+
+    def inbox(self, limit: int) -> list[dict]:
+        """최근 딜 목록. 읽어도 지워지지 않는다(롤링 버퍼)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT source, payload FROM inbox ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        deals = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"])
+            except json.JSONDecodeError:
+                continue
+            payload.setdefault("source", row["source"])
+            deals.append(payload)
+        return deals
+
     def stats(self) -> dict[str, int]:
         with self._lock:
             pending = self._conn.execute("SELECT COUNT(*) FROM outbox WHERE delivered_at IS NULL").fetchone()[0]
             delivered = self._conn.execute("SELECT COUNT(*) FROM outbox WHERE delivered_at IS NOT NULL").fetchone()[0]
-        return {"pending": int(pending), "delivered": int(delivered)}
+            inbox = self._conn.execute("SELECT COUNT(*) FROM inbox").fetchone()[0]
+        return {"pending": int(pending), "delivered": int(delivered), "inbox": int(inbox)}
 
     def prune(self, older_than_seconds: float = 86400) -> int:
         with self._lock:
@@ -134,6 +198,16 @@ class Queue:
 
 class QueueFull(RuntimeError):
     pass
+
+
+def _inbox_key(source: str, deal: dict) -> str:
+    """같은 딜을 여러 번 밀어넣어도 한 번만 쌓이게 하는 키.
+
+    UI 덤프는 화면을 볼 때마다 같은 카드를 다시 읽고, 알림 캡처도 재알림이
+    올 수 있다. url 이 있으면 url, 없으면 제목으로 판정한다.
+    """
+    basis = str(deal.get("url") or "").strip() or str(deal.get("title") or "").strip()
+    return hashlib.sha1(f"{source}|{basis}".encode("utf-8")).hexdigest()
 
 
 def make_handler(queue: Queue, token: str) -> type[BaseHTTPRequestHandler]:
@@ -191,6 +265,14 @@ def make_handler(queue: Queue, token: str) -> type[BaseHTTPRequestHandler]:
                     limit = 5
                 self._json(HTTPStatus.OK, {"ok": True, "messages": queue.pull(room, limit)})
                 return
+            if parts.path == "/inbox":
+                params = parse_qs(parts.query)
+                try:
+                    limit = max(1, min(500, int((params.get("limit") or ["100"])[0])))
+                except ValueError:
+                    limit = 100
+                self._json(HTTPStatus.OK, {"ok": True, "deals": queue.inbox(limit)})
+                return
             self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "없는 경로"})
 
         def do_POST(self) -> None:  # noqa: N802
@@ -216,6 +298,43 @@ def make_handler(queue: Queue, token: str) -> type[BaseHTTPRequestHandler]:
                     self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"ok": False, "error": str(exc)})
                     return
                 self._json(HTTPStatus.OK, {"ok": True, "id": message_id})
+                return
+
+            if parts.path == "/ingest":
+                source = str(payload.get("source") or "").strip()
+                deals = payload.get("deals")
+                if not source:
+                    self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "source 가 필요합니다"})
+                    return
+                if not isinstance(deals, list):
+                    self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "deals 는 배열이어야 합니다"})
+                    return
+                if len(deals) > MAX_INGEST_DEALS:
+                    self._json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"ok": False, "error": f"한 번에 {MAX_INGEST_DEALS}건까지만 보낼 수 있습니다"},
+                    )
+                    return
+
+                clean = []
+                for item in deals:
+                    if not isinstance(item, dict):
+                        continue
+                    title = str(item.get("title") or "").strip()
+                    if not title:
+                        continue
+                    clean.append(
+                        {
+                            "title": title[:300],
+                            "url": str(item.get("url") or "").strip()[:1000],
+                            "price_krw": item.get("price_krw"),
+                            "source": source,
+                        }
+                    )
+                if not clean:
+                    self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "유효한 딜이 없습니다 (title 필수)"})
+                    return
+                self._json(HTTPStatus.OK, {"ok": True, "accepted": queue.ingest(source, clean), "received": len(clean)})
                 return
 
             if parts.path == "/ack":
