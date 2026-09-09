@@ -1,0 +1,127 @@
+// 핫딜 봇 설정 예시
+// ------------------------------------------------------------------
+// 1) 이 파일을 config.json 으로 복사한다  (config.json 은 .gitignore 됨)
+// 2) 토큰류는 여기 직접 적지 말고 ${ENV_VAR} 로 참조한다
+// 3) 반드시 `python3 run.py verify` 로 소스가 살아있는지 먼저 확인한다
+//
+// ⚠️ 아래 피드 주소들은 실제 접속으로 검증되지 않았다. 커뮤니티 사이트의
+//    RSS 주소는 예고 없이 바뀐다. verify 가 FAIL/EMPTY 를 뱉으면 해당 사이트
+//    에서 RSS 주소를 직접 확인해 고칠 것.
+{
+  "db_path": "hotdeal.db",
+  "poll_interval_seconds": 300,
+  "max_sends_per_run": 5,
+  "send_gap_seconds": 2.0,
+  "dedup_retention_days": 14,
+  "seed_on_first_run": true,
+  "respect_robots": true,
+  "min_interval_per_host": 3.0,
+  "log_level": "INFO",
+
+  "sources": [
+    {
+      "name": "뽐뿌",
+      "type": "rss",
+      "url": "https://www.ppomppu.co.kr/rss.php?id=ppomppu",
+      "enabled": true,
+      "max_items": 40
+    },
+    {
+      "name": "뽐뿌-해외",
+      "type": "rss",
+      "url": "https://www.ppomppu.co.kr/rss.php?id=ppomppu4",
+      "enabled": false,
+      "max_items": 40
+    },
+    {
+      "name": "루리웹-핫딜",
+      "type": "rss",
+      "url": "https://bbs.ruliweb.com/market/board/1020/rss",
+      "enabled": false,
+      "max_items": 40
+    },
+    {
+      "name": "어미새",
+      "type": "rss",
+      "url": "https://eomisae.co.kr/index.php?mid=rt&act=rss",
+      "enabled": false,
+      "max_items": 40
+    },
+    // RSS 가 없는 사이트는 html_list 로 긁는다. HTML 은 개편에 훨씬 잘 깨지므로
+    // RSS 가 있으면 RSS 를 쓸 것.
+    {
+      "name": "퀘이사존-지름",
+      "type": "html_list",
+      "url": "https://quasarzone.com/bbs/qb_saleinfo",
+      "base_url": "https://quasarzone.com",
+      "link_pattern": "/bbs/qb_saleinfo/views/\\d+",
+      "enabled": false,
+      "max_items": 30
+    },
+    {
+      "name": "아카라이브-핫딜",
+      "type": "html_list",
+      "url": "https://arca.live/b/hotdeal",
+      "base_url": "https://arca.live",
+      "link_pattern": "^/b/hotdeal/\\d+",
+      "enabled": false,
+      "max_items": 30
+    }
+  ],
+
+  "filters": {
+    // 토스 관련 딜만 받고 싶을 때. 전체 핫딜을 받으려면 이 배열을 비우면 된다.
+    "include_keywords": ["토스", "토스페이", "tosspay", "8시특가", "토스쇼핑"],
+
+    // 한국어에는 단어 경계가 없어서 "토스"가 "토스트기"에 걸린다.
+    // 오탐 단어는 여기에 계속 추가해 나갈 것.
+    "exclude_keywords": ["토스트", "토스터", "토스기", "토스카나", "몬테소리"],
+
+    "require_all_keywords": false,
+    "min_price_krw": null,
+    "max_price_krw": null,
+
+    // 이 시간보다 오래된 글은 무시한다. 게시 시각을 못 얻은 글은 통과시킨다.
+    "max_age_minutes": 180
+  },
+
+  "senders": [
+    // 먼저 이걸로 확인하고, 잘 나오면 아래 실제 경로를 켠다.
+    {
+      "type": "console",
+      "enabled": true
+    },
+
+    // ── 텔레그램 (공식 API, 계정 제재 위험 없음 — 권장) ──
+    // @BotFather 로 봇 생성 → 토큰 발급 → 채널/그룹에 관리자로 초대
+    {
+      "type": "telegram",
+      "enabled": false,
+      "bot_token": "${TELEGRAM_BOT_TOKEN}",
+      "chat_id": "${TELEGRAM_CHAT_ID}",
+      "disable_web_page_preview": false,
+      "batch_size": 1
+    },
+
+    // ── 디스코드 웹훅 (가장 간단) ──
+    {
+      "type": "discord",
+      "enabled": false,
+      "webhook_url": "${DISCORD_WEBHOOK_URL}",
+      "username": "핫딜봇",
+      "batch_size": 3
+    },
+
+    // ── 카카오 오픈채팅 (비공식 — 계정 정지 위험 있음) ──
+    // bridge 서버를 띄우고, 안드로이드 메신저봇R 이 그 서버를 폴링해야 한다.
+    // 자세한 절차는 README 의 "카카오 오픈채팅 연결" 참고.
+    {
+      "type": "kakao_bridge",
+      "enabled": false,
+      "bridge_url": "http://127.0.0.1:8080",
+      "room": "오픈채팅방_정확한_이름",
+      "token": "${BRIDGE_TOKEN}",
+      "batch_size": 3
+    }
+  ]
+}
