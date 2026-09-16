@@ -1,0 +1,165 @@
+"""ipalloc.cli 검증 — 실제 운영 흐름을 처음부터 끝까지 한 번 돌린다."""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import tempfile
+import unittest
+from pathlib import Path
+
+from ipalloc.cli import main
+from ipalloc.csvio import read_assignments
+
+
+def run(*argv: str) -> tuple[int, str]:
+    out = io.StringIO()
+    err = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = main(list(argv))
+    return code, out.getvalue() + err.getvalue()
+
+
+class CliTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+
+class PlanTest(CliTestCase):
+    def test_reports_ip_count_and_capacity(self) -> None:
+        code, text = run("plan", "--users", "1000", "--per-ip", "20")
+        self.assertEqual(code, 0)
+        self.assertIn("출구 IP 50개가 필요하다", text)
+        self.assertIn("최악 필요 대역", text)
+        self.assertIn("여유 있다", text)
+
+    def test_warns_when_the_link_is_too_small(self) -> None:
+        code, text = run("plan", "--users", "1000", "--per-ip", "20", "--link-mbps", "50")
+        self.assertEqual(code, 0)
+        self.assertIn("!", text)
+        self.assertIn("Mbps 가 필요", text)
+
+    def test_warns_when_tunnel_range_is_too_small(self) -> None:
+        code, text = run("plan", "--users", "10000", "--per-ip", "20", "--tunnel-cidr", "10.77.0.0/20")
+        self.assertEqual(code, 0)
+        self.assertIn("터널 대역이 부족하다", text)
+
+
+class FullFlowTest(CliTestCase):
+    def test_sample_assign_verify_export(self) -> None:
+        users = self.dir / "users.csv"
+        out = self.dir / "out"
+
+        code, _ = run("sample-users", "--count", "1000", "--out", str(users))
+        self.assertEqual(code, 0)
+
+        code, text = run("assign", "--users", str(users), "--cidr", "203.0.113.0/26", "--out", str(out), "--per-ip", "20")
+        self.assertEqual(code, 0)
+        self.assertIn("사용자 1000명 · 묶음 50개", text)
+        self.assertIn("예제용(RFC5737)", text)  # 문서용 대역 경고
+
+        assignments = out / "assignments.csv"
+        rows = read_assignments(assignments)
+        self.assertEqual(len(rows), 1000)
+        self.assertEqual(len({r.egress_ip for r in rows}), 50)
+
+        code, text = run("verify", "--assignments", str(assignments), "--per-ip", "20")
+        self.assertEqual(code, 0)
+        self.assertIn("[정상]", text)
+
+        code, text = run("wg", "--assignments", str(assignments), "--out", str(out / "wg"), "--per-ip", "20")
+        self.assertEqual(code, 0)
+        self.assertIn("서버 설정 50개, 사용자 설정 1000개", text)
+        self.assertIn("전체 터널", text)  # AllowedIPs 기본값 경고
+        self.assertTrue((out / "wg" / "genkeys.sh").exists())
+
+    def test_incremental_assign_keeps_people_in_place(self) -> None:
+        users = self.dir / "users.csv"
+        users.write_text("user_id\n" + "".join(f"u{i:04d}\n" for i in range(1, 101)), encoding="utf-8")
+        out = self.dir / "out"
+        run("assign", "--users", str(users), "--cidr", "203.0.113.0/26", "--out", str(out), "--per-ip", "20")
+        before = {a.user_id: a.egress_ip for a in read_assignments(out / "assignments.csv")}
+
+        # 한 명 빠지고 한 명 들어온다.
+        users.write_text(
+            "user_id\n" + "".join(f"u{i:04d}\n" for i in range(1, 101) if i != 5) + "u9999\n",
+            encoding="utf-8",
+        )
+        out2 = self.dir / "out2"
+        code, text = run(
+            "assign",
+            "--users",
+            str(users),
+            "--cidr",
+            "203.0.113.0/26",
+            "--out",
+            str(out2),
+            "--per-ip",
+            "20",
+            "--existing",
+            str(out / "assignments.csv"),
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("유지 99", text)
+        self.assertIn("신규 1", text)
+        self.assertIn("명부에서 빠진 사용자 1명", text)
+
+        after = {a.user_id: a.egress_ip for a in read_assignments(out2 / "assignments.csv")}
+        self.assertNotIn("u0005", after)
+        for uid, ip in before.items():
+            if uid == "u0005":
+                continue
+            self.assertEqual(after[uid], ip, f"{uid} 의 출구 IP 가 바뀌었다")
+
+
+class FailureTest(CliTestCase):
+    def test_not_enough_ips_is_an_error_by_default(self) -> None:
+        users = self.dir / "users.csv"
+        run("sample-users", "--count", "100", "--out", str(users))
+        code, text = run("assign", "--users", str(users), "--cidr", "203.0.113.0/29", "--out", str(self.dir / "o"), "--per-ip", "5")
+        self.assertEqual(code, 1)
+        self.assertIn("출구 IP 가 부족하다", text)
+
+    def test_allow_partial_reports_instead_of_failing_early(self) -> None:
+        users = self.dir / "users.csv"
+        run("sample-users", "--count", "100", "--out", str(users))
+        code, text = run(
+            "assign", "--users", str(users), "--cidr", "203.0.113.0/29", "--out", str(self.dir / "o"), "--per-ip", "5", "--allow-partial"
+        )
+        self.assertEqual(code, 1)  # verify 가 미배정을 문제로 잡는다
+        self.assertIn("미배정 70", text)
+
+    def test_missing_file_is_reported_not_traced(self) -> None:
+        code, text = run("assign", "--users", str(self.dir / "nope.csv"), "--cidr", "203.0.113.0/29", "--out", str(self.dir / "o"))
+        self.assertEqual(code, 1)
+        self.assertIn("오류:", text)
+        self.assertIn("파일이 없다", text)
+
+    def test_unwritable_out_path_is_reported_not_traced(self) -> None:
+        users = self.dir / "users.csv"
+        run("sample-users", "--count", "10", "--out", str(users))
+        blocker = self.dir / "blocker"
+        blocker.write_text("파일이지 디렉터리가 아니다\n", encoding="utf-8")
+        code, text = run("assign", "--users", str(users), "--cidr", "203.0.113.0/29", "--out", str(blocker / "sub"))
+        self.assertEqual(code, 1)
+        self.assertIn("오류:", text)
+        self.assertNotIn("Traceback", text)
+
+    def test_wg_refuses_to_export_a_broken_table(self) -> None:
+        bad = self.dir / "bad.csv"
+        bad.write_text(
+            "user_id,group_id,egress_ip,tunnel_ip,listen_host,listen_port,label\n"
+            "u001,g001,203.0.113.1,10.77.0.2,203.0.113.1,51820,\n"
+            "u001,g002,203.0.113.2,10.77.1.2,203.0.113.2,51820,\n",
+            encoding="utf-8",
+        )
+        code, text = run("wg", "--assignments", str(bad), "--out", str(self.dir / "wg"))
+        self.assertEqual(code, 1)
+        self.assertIn("중복 배정", text)
+        self.assertFalse((self.dir / "wg").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

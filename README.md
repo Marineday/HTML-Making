@@ -15,13 +15,14 @@
 ```
 
 - **외부 의존성 0** — 파이썬 3.11 표준 라이브러리만 사용한다. `pip install` 불필요.
-- **테스트 212개** — `python3 -m unittest discover -s tests -t .`
+- **테스트 313개** — `python3 -m unittest discover -s tests -t .`
 
 | 문서 | 내용 |
 |---|---|
 | [docs/pricing.md](docs/pricing.md) | 단가 계산과 초특가 판정 |
 | [docs/toss-capture.md](docs/toss-capture.md) | 토스 앱에서 핫딜 수집 |
 | [docs/kakao-setup.md](docs/kakao-setup.md) | 카카오 오픈채팅 연결 |
+| [docs/ip-allocation.md](docs/ip-allocation.md) | VPN 출구 IP 배정 (`ipalloc`) — 핫딜 봇과 별개 도구 |
 
 ---
 
@@ -248,7 +249,16 @@ hotdeal/
 bridge/server.py          메시지 큐(lease/ack) + 딜 인박스(롤링 버퍼)
 messengerbot/hotdeal.js   안드로이드 메신저봇R 스크립트
 tools/toss_capture.py     토스 앱 UI 덤프 → 딜 추출 → 브리지 전송
-tests/                    unittest 212개
+tests/                    unittest 313개 (핫딜 봇 212 + ipalloc 101)
+
+ipalloc/                  VPN 출구 IP 배정 (핫딜 봇과 독립)
+  models.py               User / Endpoint / Assignment / Group 값 객체와 검증
+  pool.py                 출구 IP 풀, 터널 대역 분할, 소요 IP 수 산정
+  allocator.py            묶기·배정·증분 재배정·불변식 검사
+  capacity.py             동시접속·대역폭·전송량 산정 (포아송 + 최악)
+  csvio.py                명부/IP목록/배정표 CSV 입출력
+  wireguard.py            서버·사용자 설정과 키 생성 스크립트 생성
+  cli.py                  python3 -m ipalloc
 ```
 
 ### 설계상 지키는 것
@@ -281,6 +291,34 @@ tests/                    unittest 212개
 
 ---
 
+## 부록: ipalloc — VPN 출구 IP 배정
+
+핫딜 봇과는 **별개의 도구**다. 같은 저장소에 있을 뿐 코드를 공유하지 않는다.
+
+자체 운영하는 영상 서비스의 사용자를 N 명씩 묶어, 한 묶음이 항상 같은 출구 IP 로
+나가게 만든다. 배정표(CSV)와 WireGuard 설정을 생성하고, 용량이 실제로 충분한지
+계산한다.
+
+```bash
+python3 -m ipalloc plan --users 1000 --per-ip 20
+# → 출구 IP 50개 필요 · IP 당 월 15 GB · 최악(20명 동시) 100 Mbps
+
+python3 -m ipalloc assign --users users.csv --endpoints endpoints.csv --out out/
+python3 -m ipalloc wg --assignments out/assignments.csv --out out/wg/
+sh out/wg/genkeys.sh    # 키 생성 (wireguard-tools 필요)
+```
+
+핵심 성질 두 가지:
+
+- **결정적·증분적** — `--existing` 으로 기존 배정표를 주면 이미 배정된 사람은
+  움직이지 않는다. 빠진 자리부터 채운다.
+- **키를 만들지 않는다** — 설정 파일에는 자리표시자만 넣고, `wg genkey` 로 채우는
+  스크립트를 같이 내보낸다. 파이썬으로 암호키를 만드는 것보다 안전하다.
+
+절차와 주의사항은 [docs/ip-allocation.md](docs/ip-allocation.md) 에 있다.
+
+---
+
 ## 테스트
 
 ```bash
@@ -305,3 +343,5 @@ python3 -m unittest discover -s tests -t . -v
 | 텔레그램 / 디스코드 전송 | ⚠️ 개발 환경 방화벽으로 실제 API 호출 미검증 |
 | `config.example.json` 의 커뮤니티 피드 주소 | ⚠️ **미검증** — `run.py verify` 로 직접 확인 필요 |
 | `messengerbot/hotdeal.js` (안드로이드) | ⚠️ **실기기 미검증** — 문법 검사만 통과. 버전별 API 차이는 런타임 탐지로 대응 |
+| `ipalloc` 배정·검증·용량 산정 | ✅ 테스트 통과 (1,000명 → 50 IP 종단 확인) |
+| `ipalloc` WireGuard 설정 생성 + `genkeys.sh` | ⚠️ **실서버 미검증** — 설정 생성과 키 치환 로직은 `wg` 스텁으로 확인. 실제 터널 수립·SNAT 동작은 미확인 |

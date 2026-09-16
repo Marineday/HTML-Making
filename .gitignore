@@ -4,6 +4,16 @@ config.json
 *.sqlite3
 .env
 
+# ipalloc 출력물. 개인키와 명부가 들어가므로 절대 커밋하지 않는다.
+out/
+*.key
+*.psk
+*.pub
+users.csv
+endpoints.csv
+assignments.csv
+groups.csv
+
 # python
 __pycache__/
 *.py[cod]
