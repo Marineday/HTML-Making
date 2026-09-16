@@ -15,7 +15,7 @@
 ```
 
 - **외부 의존성 0** — 파이썬 3.11 표준 라이브러리만 사용한다. `pip install` 불필요.
-- **테스트 313개** — `python3 -m unittest discover -s tests -t .`
+- **테스트 332개** — `python3 -m unittest discover -s tests -t .`
 
 | 문서 | 내용 |
 |---|---|
@@ -249,13 +249,14 @@ hotdeal/
 bridge/server.py          메시지 큐(lease/ack) + 딜 인박스(롤링 버퍼)
 messengerbot/hotdeal.js   안드로이드 메신저봇R 스크립트
 tools/toss_capture.py     토스 앱 UI 덤프 → 딜 추출 → 브리지 전송
-tests/                    unittest 313개 (핫딜 봇 212 + ipalloc 101)
+tests/                    unittest 332개 (핫딜 봇 212 + ipalloc 120)
 
 ipalloc/                  VPN 출구 IP 배정 (핫딜 봇과 독립)
   models.py               User / Endpoint / Assignment / Group 값 객체와 검증
   pool.py                 출구 IP 풀, 터널 대역 분할, 소요 IP 수 산정
   allocator.py            묶기·배정·증분 재배정·불변식 검사
   capacity.py             동시접속·대역폭·전송량 산정 (포아송 + 최악)
+  cost.py                 조달 방식별 월 비용과 손익분기 GB 단가
   csvio.py                명부/IP목록/배정표 CSV 입출력
   wireguard.py            서버·사용자 설정과 키 생성 스크립트 생성
   cli.py                  python3 -m ipalloc
@@ -302,6 +303,9 @@ ipalloc/                  VPN 출구 IP 배정 (핫딜 봇과 독립)
 ```bash
 python3 -m ipalloc plan --users 1000 --per-ip 20
 # → 출구 IP 50개 필요 · IP 당 월 15 GB · 최악(20명 동시) 100 Mbps
+
+python3 -m ipalloc cost --users 1000 --dc-ip-monthly 3.6 --res-per-gb 2.0
+# → 데이터센터 vs 레지덴셜 월 비용과 손익분기 GB 단가
 
 python3 -m ipalloc assign --users users.csv --endpoints endpoints.csv --out out/
 python3 -m ipalloc wg --assignments out/assignments.csv --out out/wg/

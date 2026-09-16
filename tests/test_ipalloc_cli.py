@@ -47,6 +47,40 @@ class PlanTest(CliTestCase):
         self.assertIn("터널 대역이 부족하다", text)
 
 
+class CostTest(CliTestCase):
+    ARGS = ("cost", "--users", "1000", "--per-ip", "20", "--dc-ip-monthly", "3.6", "--dc-hosts", "2", "--dc-host-monthly", "20")
+
+    def test_residential_loses_at_realistic_per_gb(self) -> None:
+        code, text = run(*self.ARGS, "--dc-egress-per-gb", "0.09", "--res-per-gb", "2.0")
+        self.assertEqual(code, 0)
+        self.assertIn("월 전송량 750 GB", text)
+        self.assertIn("초과", text)
+        self.assertIn("손익분기 GB 단가: 0.3300", text)
+        # 레지덴셜을 써도 진입 호스트는 필요하다는 점이 드러나야 한다.
+        self.assertIn("대체가 아니라 추가", text)
+
+    def test_residential_wins_below_breakeven(self) -> None:
+        code, text = run(*self.ARGS, "--dc-egress-per-gb", "0.09", "--res-per-gb", "0.1")
+        self.assertEqual(code, 0)
+        self.assertIn("저렴", text)
+
+    def test_static_isp_per_ip_pricing(self) -> None:
+        code, text = run(*self.ARGS, "--res-ip-monthly", "5.0")
+        self.assertEqual(code, 0)
+        self.assertIn("250.00", text)  # 50 x 5.0
+
+    def test_requires_a_datacenter_price(self) -> None:
+        code, text = run("cost", "--users", "1000", "--per-ip", "20")
+        self.assertEqual(code, 1)
+        self.assertIn("--dc-ip-monthly", text)
+
+    def test_says_when_fixed_cost_alone_already_loses(self) -> None:
+        # 레지덴셜에 IP 월정액까지 붙으면 GB 단가가 0이어도 못 이기는 경우가 나온다.
+        code, text = run("cost", "--users", "1000", "--per-ip", "20", "--dc-ip-monthly", "1.0", "--res-ip-monthly", "20.0")
+        self.assertEqual(code, 0)
+        self.assertIn("GB 단가가 0이어도 이길 수 없는 구조", text)
+
+
 class FullFlowTest(CliTestCase):
     def test_sample_assign_verify_export(self) -> None:
         users = self.dir / "users.csv"

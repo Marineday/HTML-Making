@@ -13,7 +13,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import allocator, capacity, csvio, pool, wireguard
+from . import allocator, capacity, cost, csvio, pool, wireguard
 from .models import ModelError, User
 
 EXIT_OK = 0
@@ -74,6 +74,63 @@ def cmd_plan(args: argparse.Namespace) -> int:
 def cmd_capacity(args: argparse.Namespace) -> int:
     need = pool.required_groups(args.users, args.per_ip)
     _print_capacity(args.users, need, _workload(args), args.link_mbps, args.quota_gb)
+    return EXIT_OK
+
+
+def cmd_cost(args: argparse.Namespace) -> int:
+    """데이터센터 고정 IP 와 레지덴셜 종량을 같은 워크로드에서 비교한다."""
+    ip_count = pool.required_groups(args.users, args.per_ip)
+    fleet = capacity.for_fleet(args.users, ip_count, _workload(args))
+    transfer_gb = fleet.total_transfer_gb_month
+
+    if args.dc_ip_monthly <= 0:
+        print("오류: --dc-ip-monthly 에 실제 견적을 넣어야 비교할 수 있다.", file=sys.stderr)
+        print("      예: --dc-ip-monthly 3.6 --dc-hosts 2 --dc-host-monthly 20 --res-per-gb 2.0", file=sys.stderr)
+        return EXIT_FAIL
+
+    dc = cost.estimate(
+        "데이터센터",
+        ip_count=ip_count,
+        transfer_gb=transfer_gb,
+        prices=cost.PriceBook(
+            ip_monthly=args.dc_ip_monthly,
+            host_monthly=args.dc_host_monthly,
+            hosts=args.dc_hosts,
+            egress_per_gb=args.dc_egress_per_gb,
+        ),
+    )
+    # 레지덴셜을 써도 사용자가 인바운드로 붙을 호스트는 그대로 필요하다.
+    res = cost.estimate(
+        "레지덴셜",
+        ip_count=ip_count,
+        transfer_gb=transfer_gb,
+        prices=cost.PriceBook(
+            ip_monthly=args.res_ip_monthly,
+            host_monthly=args.dc_host_monthly,
+            hosts=args.dc_hosts,
+            per_gb=args.res_per_gb,
+        ),
+    )
+
+    print(f"\n워크로드: 사용자 {args.users:,}명 · 출구 IP {ip_count}개 · 월 전송량 {transfer_gb:,.0f} GB")
+    print("\n[데이터센터 고정 IP]")
+    print(_table(dc.table()))
+    print("\n[레지덴셜]")
+    print(_table(res.table()))
+    print("  * 레지덴셜은 프록시 엔드포인트라 WireGuard 를 띄울 수 없다. 진입용")
+    print("    데이터센터 호스트 비용이 양쪽에 똑같이 들어가 있다 — 대체가 아니라 추가다.")
+
+    print("\n[판정]")
+    for line in cost.compare(dc, res):
+        print(f"  {line}")
+
+    be = cost.breakeven_per_gb(dc.total, res.fixed, transfer_gb)
+    if be is None:
+        print(f"  레지덴셜은 고정비({res.fixed:,.2f})만으로 이미 데이터센터 총액({dc.total:,.2f})을 넘는다.")
+        print("  GB 단가가 0이어도 이길 수 없는 구조다.")
+    else:
+        print(f"  손익분기 GB 단가: {be:.4f}")
+        print(f"  이보다 싼 종량 단가를 받아야 레지덴셜이 유리하다. 현재 넣은 단가는 {args.res_per_gb:.4f} 다.")
     return EXIT_OK
 
 
@@ -200,6 +257,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_capacity_args(p)
     p.set_defaults(func=cmd_capacity)
 
+    p = sub.add_parser("cost", help="데이터센터 고정 IP 와 레지덴셜 종량의 월 비용을 비교한다")
+    p.add_argument("--users", type=int, required=True)
+    p.add_argument("--dc-ip-monthly", type=float, default=0.0, help="데이터센터 IP 1개의 월정액 (필수)")
+    p.add_argument("--dc-hosts", type=int, default=1, help="진입용 호스트 대수. 기본 1")
+    p.add_argument("--dc-host-monthly", type=float, default=0.0, help="호스트 1대의 월정액")
+    p.add_argument("--dc-egress-per-gb", type=float, default=0.0, help="전송량 GB 당 단가. 전송량 포함 VPS 면 0")
+    p.add_argument("--res-per-gb", type=float, default=0.0, help="레지덴셜 종량 GB 당 단가")
+    p.add_argument("--res-ip-monthly", type=float, default=0.0, help="static ISP 프록시처럼 IP 월정액이 있는 경우")
+    _add_tunnel_args(p)
+    _add_capacity_args(p)
+    p.set_defaults(func=cmd_cost)
+
     p = sub.add_parser("sample-users", help="테스트용 명부 CSV 를 만든다")
     p.add_argument("--count", type=int, default=1000)
     p.add_argument("--prefix", default="u")
@@ -248,6 +317,7 @@ def main(argv: list[str] | None = None) -> int:
         pool.PoolError,
         allocator.AllocationError,
         capacity.CapacityError,
+        cost.CostError,
     ) as exc:
         print(f"오류: {exc}", file=sys.stderr)
         return EXIT_FAIL
