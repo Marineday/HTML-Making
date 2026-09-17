@@ -15,7 +15,7 @@
 ```
 
 - **외부 의존성 0** — 파이썬 3.11 표준 라이브러리만 사용한다. `pip install` 불필요.
-- **테스트 332개** — `python3 -m unittest discover -s tests -t .`
+- **테스트 397개** — `python3 -m unittest discover -s tests -t .`
 
 | 문서 | 내용 |
 |---|---|
@@ -23,6 +23,7 @@
 | [docs/toss-capture.md](docs/toss-capture.md) | 토스 앱에서 핫딜 수집 |
 | [docs/kakao-setup.md](docs/kakao-setup.md) | 카카오 오픈채팅 연결 |
 | [docs/ip-allocation.md](docs/ip-allocation.md) | VPN 출구 IP 배정 (`ipalloc`) — 핫딜 봇과 별개 도구 |
+| [docs/residential-proxy.md](docs/residential-proxy.md) | 레지덴셜 프록시를 출구로 쓰는 경로 |
 
 ---
 
@@ -249,7 +250,7 @@ hotdeal/
 bridge/server.py          메시지 큐(lease/ack) + 딜 인박스(롤링 버퍼)
 messengerbot/hotdeal.js   안드로이드 메신저봇R 스크립트
 tools/toss_capture.py     토스 앱 UI 덤프 → 딜 추출 → 브리지 전송
-tests/                    unittest 332개 (핫딜 봇 212 + ipalloc 120)
+tests/                    unittest 397개 (핫딜 봇 212 + ipalloc 185)
 
 ipalloc/                  VPN 출구 IP 배정 (핫딜 봇과 독립)
   models.py               User / Endpoint / Assignment / Group 값 객체와 검증
@@ -259,6 +260,9 @@ ipalloc/                  VPN 출구 IP 배정 (핫딜 봇과 독립)
   cost.py                 조달 방식별 월 비용과 손익분기 GB 단가
   csvio.py                명부/IP목록/배정표 CSV 입출력
   wireguard.py            서버·사용자 설정과 키 생성 스크립트 생성
+  proxy.py                레지덴셜 프록시 모델, sticky 세션 토큰
+  proxychain.py           진입 호스트 + 묶음별 redsocks + iptables 생성
+  proxycheck.py           SOCKS5 로 실제 출구 IP 관측 (의존성 없이 직접 구현)
   cli.py                  python3 -m ipalloc
 ```
 
@@ -319,6 +323,10 @@ sh out/wg/genkeys.sh    # 키 생성 (wireguard-tools 필요)
 - **키를 만들지 않는다** — 설정 파일에는 자리표시자만 넣고, `wg genkey` 로 채우는
   스크립트를 같이 내보낸다. 파이썬으로 암호키를 만드는 것보다 안전하다.
 
+출구를 데이터센터 고정 IP 대신 레지덴셜 프록시로 두는 경로도 지원한다. 진입 IP 는
+1개로 줄지만 출구가 sticky(고정 아님)가 되고 UDP 가 죽는다 — 절차와 측정 방법은
+[docs/residential-proxy.md](docs/residential-proxy.md).
+
 절차와 주의사항은 [docs/ip-allocation.md](docs/ip-allocation.md) 에 있다.
 
 ---
@@ -349,3 +357,6 @@ python3 -m unittest discover -s tests -t . -v
 | `messengerbot/hotdeal.js` (안드로이드) | ⚠️ **실기기 미검증** — 문법 검사만 통과. 버전별 API 차이는 런타임 탐지로 대응 |
 | `ipalloc` 배정·검증·용량 산정 | ✅ 테스트 통과 (1,000명 → 50 IP 종단 확인) |
 | `ipalloc` WireGuard 설정 생성 + `genkeys.sh` | ⚠️ **실서버 미검증** — 설정 생성과 키 치환 로직은 `wg` 스텁으로 확인. 실제 터널 수립·SNAT 동작은 미확인 |
+| `ipalloc` SOCKS5 클라이언트 (`proxy-check`) | ✅ 실제 소켓 종단 테스트 통과 (인증, 오류코드, 도메인 전달 포함) |
+| `ipalloc` 레지덴셜 체인 생성 (`proxy-export`) | ⚠️ **실서버 미검증** — 스크립트 문법과 자리표시자 치환은 확인. redsocks 기동·iptables REDIRECT 실동작은 미확인 |
+| 레지덴셜 sticky 세션 유지 여부 | ❓ **측정 필요** — 공급사에 달렸다. `proxy-check` → `proxy-sticky` 로 직접 확인할 것 |

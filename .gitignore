@@ -13,6 +13,8 @@ users.csv
 endpoints.csv
 assignments.csv
 groups.csv
+proxies.csv
+peers.csv
 
 # python
 __pycache__/

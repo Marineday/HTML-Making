@@ -17,6 +17,7 @@ from typing import Iterable, Sequence
 
 from .models import Assignment, Endpoint, Group, ModelError, User
 from .pool import TunnelPlan
+from .proxy import ProxyEndpoint, ProxyError
 
 ASSIGNMENT_COLUMNS = ["user_id", "group_id", "egress_ip", "tunnel_ip", "listen_host", "listen_port", "label"]
 GROUP_COLUMNS = ["group_id", "egress_ip", "subnet", "server_ip", "listen_host", "listen_port", "members", "vacancies", "region", "provider"]
@@ -95,6 +96,46 @@ def read_endpoints(path: str | Path) -> list[Endpoint]:
     if not eps:
         raise CsvError(f"{path} 에서 출구 IP 를 하나도 읽지 못했다. `ip` 컬럼이 있는지 확인할 것.")
     return eps
+
+
+def read_proxies(path: str | Path) -> list[ProxyEndpoint]:
+    """업스트림 프록시 목록을 읽는다.
+
+    `host` 와 `port` 만 필수다. password 에는 평문 대신 `${ENV_VAR}` 를 적는다 —
+    이 함수는 그 참조를 **치환하지 않고 그대로 둔다.** 실제 값은 프록시에
+    붙는 순간에만 읽는다.
+    """
+    out: list[ProxyEndpoint] = []
+    for n, row in enumerate(_rows(path), start=2):
+        host = row.get("host") or row.get("proxy_host") or ""
+        if not host:
+            continue
+        port_raw = row.get("port") or row.get("proxy_port") or ""
+        if not port_raw:
+            raise CsvError(f"{path} {n}번째 줄: port 가 비어 있다.")
+        try:
+            port = int(port_raw)
+        except ValueError as exc:
+            raise CsvError(f"{path} {n}번째 줄: 포트 '{port_raw}' 는 숫자가 아니다.") from exc
+        try:
+            out.append(
+                ProxyEndpoint(
+                    host=host,
+                    port=port,
+                    protocol=row.get("protocol") or "socks5",
+                    username=row.get("username", ""),
+                    password=row.get("password", ""),
+                    provider=row.get("provider", ""),
+                    region=row.get("region", ""),
+                    sticky_template=row.get("sticky_template", ""),
+                    note=row.get("note", ""),
+                )
+            )
+        except ProxyError as exc:
+            raise CsvError(f"{path} {n}번째 줄: {exc}") from exc
+    if not out:
+        raise CsvError(f"{path} 에서 프록시를 하나도 읽지 못했다. `host` 와 `port` 컬럼이 있는지 확인할 것.")
+    return out
 
 
 def read_assignments(path: str | Path) -> list[Assignment]:
@@ -184,6 +225,7 @@ __all__ = [
     "CsvError",
     "read_assignments",
     "read_endpoints",
+    "read_proxies",
     "read_users",
     "write_assignments",
     "write_groups",

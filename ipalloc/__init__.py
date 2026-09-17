@@ -17,4 +17,15 @@
 
 from __future__ import annotations
 
-__all__ = ["allocator", "capacity", "cost", "csvio", "models", "pool", "wireguard"]
+__all__ = [
+    "allocator",
+    "capacity",
+    "cost",
+    "csvio",
+    "models",
+    "pool",
+    "proxy",
+    "proxycheck",
+    "proxychain",
+    "wireguard",
+]

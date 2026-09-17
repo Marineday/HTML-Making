@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ipalloc.cli import main
 from ipalloc.csvio import read_assignments
@@ -146,6 +148,132 @@ class FullFlowTest(CliTestCase):
             if uid == "u0005":
                 continue
             self.assertEqual(after[uid], ip, f"{uid} 의 출구 IP 가 바뀌었다")
+
+
+class ProxyModeTest(CliTestCase):
+    """레지덴셜 경로 — 내보내기부터 실제 SOCKS5 확인까지."""
+
+    def _setup_assignments(self, count: int = 100, per_ip: int = 20) -> Path:
+        users = self.dir / "users.csv"
+        run("sample-users", "--count", str(count), "--out", str(users))
+        out = self.dir / "out"
+        run("assign", "--users", str(users), "--cidr", "198.18.0.0/26", "--out", str(out), "--per-ip", str(per_ip))
+        return out / "assignments.csv"
+
+    def _write_proxies(self, rows: list[str]) -> Path:
+        p = self.dir / "proxies.csv"
+        p.write_text("host,port,protocol,username,password\n" + "".join(rows), encoding="utf-8")
+        return p
+
+    def test_export_produces_a_runnable_bundle(self) -> None:
+        assignments = self._setup_assignments()
+        proxies = self._write_proxies([f"gw{i}.example.com,8000,socks5,cust,${{PROXY_PW}}\n" for i in range(1, 6)])
+        out = self.dir / "px"
+        code, text = run(
+            "proxy-export", "--assignments", str(assignments), "--proxies", str(proxies), "--entry-host", "vpn.example.com", "--out", str(out)
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("묶음 5개, 사용자 설정 100개", text)
+        self.assertIn("공인 IP 1개면 된다", text)
+        self.assertTrue((out / "wg0.conf").exists())
+        self.assertEqual(len(list((out / "redsocks").glob("*.conf"))), 5)
+
+    def test_export_warns_about_plaintext_passwords(self) -> None:
+        assignments = self._setup_assignments()
+        proxies = self._write_proxies([f"gw{i}.example.com,8000,socks5,cust,literalpw\n" for i in range(1, 6)])
+        code, text = run(
+            "proxy-export", "--assignments", str(assignments), "--proxies", str(proxies), "--entry-host", "vpn.example.com", "--out", str(self.dir / "px")
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("평문 비밀번호가 5건", text)
+
+    def test_export_refuses_when_proxies_are_short(self) -> None:
+        assignments = self._setup_assignments()
+        proxies = self._write_proxies(["gw1.example.com,8000,socks5,cust,${PROXY_PW}\n"])
+        code, text = run(
+            "proxy-export", "--assignments", str(assignments), "--proxies", str(proxies), "--entry-host", "vpn.example.com", "--out", str(self.dir / "px")
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("프록시가 부족하다", text)
+
+    def test_check_reports_real_egress_ips(self) -> None:
+        from tests.test_ipalloc_proxycheck import FakeSocks5Server
+
+        # 묶음마다 다른 출구를 주는 서버 두 대. 한 대로 두 줄을 쓰면
+        # host:port:username 이 같아 dedupe 에 걸린다 — 그게 올바른 동작이다.
+        first = FakeSocks5Server(egress_ip="198.51.100.42", require_auth=True, password="hunter2")
+        second = FakeSocks5Server(egress_ip="198.51.100.77", require_auth=True, password="hunter2")
+        self.addCleanup(first.close)
+        self.addCleanup(second.close)
+
+        assignments = self._setup_assignments(count=40)
+        proxies = self._write_proxies(
+            [f"127.0.0.1,{first.port},socks5,cust,${{IPALLOC_TEST_PW}}\n", f"127.0.0.1,{second.port},socks5,cust,${{IPALLOC_TEST_PW}}\n"]
+        )
+        results_csv = self.dir / "run1.csv"
+
+        with mock.patch.dict(os.environ, {"IPALLOC_TEST_PW": "hunter2"}, clear=False):
+            code, text = run(
+                "proxy-check", "--assignments", str(assignments), "--proxies", str(proxies),
+                "--echo-url", "http://echo.example.com/", "--timeout", "5", "--out", str(results_csv),
+            )
+        self.assertEqual(code, 0)
+        self.assertIn("198.51.100.42", text)
+        self.assertIn("198.51.100.77", text)
+        self.assertIn("고유 출구 IP 2개", text)
+        self.assertNotIn("같은 출구 IP", text)
+        self.assertTrue(results_csv.exists())
+        # 묶음마다 다른 sticky 사용자명을 제시해야 한다.
+        self.assertNotEqual(first.seen_usernames, second.seen_usernames)
+
+    def test_check_flags_groups_that_share_an_exit(self) -> None:
+        from tests.test_ipalloc_proxycheck import FakeSocks5Server
+
+        # 두 프록시가 같은 출구를 주면 sticky 가 묶음별로 갈리지 않은 것이다.
+        first = FakeSocks5Server(egress_ip="198.51.100.42")
+        second = FakeSocks5Server(egress_ip="198.51.100.42")
+        self.addCleanup(first.close)
+        self.addCleanup(second.close)
+
+        assignments = self._setup_assignments(count=40)
+        proxies = self._write_proxies([f"127.0.0.1,{first.port},socks5,,\n", f"127.0.0.1,{second.port},socks5,,\n"])
+        code, text = run(
+            "proxy-check", "--assignments", str(assignments), "--proxies", str(proxies), "--echo-url", "http://e.example.com/", "--timeout", "5"
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("같은 출구 IP", text)
+        self.assertIn("g001, g002", text)
+
+    def test_check_reports_auth_failure_without_crashing(self) -> None:
+        from tests.test_ipalloc_proxycheck import FakeSocks5Server
+
+        server = FakeSocks5Server(require_auth=True, password="right")
+        self.addCleanup(server.close)
+        assignments = self._setup_assignments(count=20)
+        proxies = self._write_proxies([f"127.0.0.1,{server.port},socks5,cust,${{IPALLOC_TEST_PW}}\n"])
+
+        with mock.patch.dict(os.environ, {"IPALLOC_TEST_PW": "wrong"}, clear=False):
+            code, text = run("proxy-check", "--assignments", str(assignments), "--proxies", str(proxies), "--echo-url", "http://e.example.com/", "--timeout", "5")
+        self.assertEqual(code, 1)
+        self.assertIn("인증에 실패", text)
+
+    def test_check_fails_loudly_when_password_env_is_missing(self) -> None:
+        assignments = self._setup_assignments(count=20)
+        proxies = self._write_proxies(["gw1.example.com,8000,socks5,cust,${NOPE_NOT_SET_ANYWHERE}\n"])
+        code, text = run("proxy-check", "--assignments", str(assignments), "--proxies", str(proxies), "--timeout", "2")
+        self.assertEqual(code, 1)
+        self.assertIn("NOPE_NOT_SET_ANYWHERE", text)
+
+    def test_sticky_compares_two_runs(self) -> None:
+        before = self.dir / "b.csv"
+        after = self.dir / "a.csv"
+        header = "group_id,ok,egress_ip,elapsed_ms,error\n"
+        before.write_text(header + "g001,1,198.51.100.1,10,\ng002,1,198.51.100.2,10,\n", encoding="utf-8")
+        after.write_text(header + "g001,1,198.51.100.1,10,\ng002,1,198.51.100.99,10,\n", encoding="utf-8")
+        code, text = run("proxy-sticky", "--before", str(before), "--after", str(after))
+        self.assertEqual(code, 0)
+        self.assertIn("유지 1개", text)
+        self.assertIn("변경 1개", text)
 
 
 class FailureTest(CliTestCase):

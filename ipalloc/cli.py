@@ -13,7 +13,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import allocator, capacity, cost, csvio, pool, wireguard
+from . import allocator, capacity, cost, csvio, pool, proxy, proxychain, proxycheck, wireguard
 from .models import ModelError, User
 
 EXIT_OK = 0
@@ -227,6 +227,132 @@ def cmd_wg(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_proxy_export(args: argparse.Namespace) -> int:
+    """레지덴셜 프록시 경로용 서버·사용자 설정을 내보낸다."""
+    assignments = csvio.read_assignments(args.assignments)
+    tunnel = _tunnel(args)
+    alloc = allocator.rebuild(assignments, group_size=args.per_ip, tunnel=tunnel)
+    problems = allocator.verify(alloc)
+    if problems:
+        print("[검증 실패] 설정을 내보내지 않는다. 배정표를 먼저 고칠 것.")
+        for p in problems:
+            print(f"  ! {p}")
+        return EXIT_FAIL
+
+    proxies = proxy.dedupe_proxies(csvio.read_proxies(args.proxies))
+    plaintext = [p.redacted() for p in proxies if p.needs_auth and p.password_env_var is None]
+    if plaintext:
+        print(f"  ! 평문 비밀번호가 {len(plaintext)}건 있다 ({plaintext[0]} …).")
+        print("    CSV 의 password 컬럼에는 ${ENV_VAR} 형태로 적는 편이 안전하다.")
+
+    opts = proxychain.ChainOptions(
+        entry_host=args.entry_host,
+        entry_port=args.entry_port,
+        wg_interface=args.wg_interface,
+        redsocks_base_port=args.redsocks_base_port,
+        mtu=args.mtu,
+        salt=args.salt,
+    )
+    counts = proxychain.export(
+        alloc,
+        proxies,
+        args.out,
+        tunnel=tunnel,
+        opts=opts,
+        client_opts=wireguard.ExportOptions(allowed_ips=args.allowed_ips, dns=args.dns, mtu=args.mtu),
+    )
+
+    out = Path(args.out)
+    print(f"묶음 {counts['groups']}개, 사용자 설정 {counts['clients']}개를 {out} 에 썼다.")
+    print(f"  진입 호스트: {args.entry_host}:{args.entry_port} (공인 IP 1개면 된다)")
+    print("  배정표의 egress_ip 는 이 경로에서 쓰이지 않는다 — 출구는 프록시가 정한다.")
+    print("\n  서버에서 순서대로:")
+    print(f"    sh {out / 'genkeys.sh'}       # WireGuard 키")
+    print(f"    sh {out / 'fill-secrets.sh'}  # 프록시 비밀번호 (환경변수 필요)")
+    print(f"    sh {out / 'iptables.sh'} up   # 묶음별 경로 + UDP 정책")
+    print("\n  확인 안 하고 운영에 넣지 말 것:")
+    print(f"    python3 -m ipalloc proxy-check --assignments {args.assignments} --proxies {args.proxies}")
+    return EXIT_OK
+
+
+def cmd_proxy_check(args: argparse.Namespace) -> int:
+    """묶음별로 프록시를 통해 실제 출구 IP 를 확인한다."""
+    assignments = csvio.read_assignments(args.assignments)
+    alloc = allocator.rebuild(assignments, group_size=args.per_ip, tunnel=_tunnel(args))
+    groups = alloc.used_groups
+    proxies = proxy.dedupe_proxies(csvio.read_proxies(args.proxies))
+    if len(proxies) < len(groups):
+        print(f"오류: 묶음 {len(groups)}개에 프록시는 {len(proxies)}개뿐이다.", file=sys.stderr)
+        return EXIT_FAIL
+
+    limit = args.limit if args.limit > 0 else len(groups)
+    results: list[proxycheck.CheckResult] = []
+    print(f"에코 URL: {args.echo_url}")
+    print(f"확인 대상: 묶음 {min(limit, len(groups))}개\n")
+    for group, upstream in list(zip(groups, proxies))[:limit]:
+        result = proxycheck.check_group(
+            group.id,
+            upstream.host,
+            upstream.port,
+            username=proxy.sticky_username(upstream, group.id, salt=args.salt),
+            password=upstream.resolve_password() if upstream.needs_auth else "",
+            echo_url=args.echo_url,
+            timeout=args.timeout,
+        )
+        results.append(result)
+        print(f"  {result.line()}")
+
+    print()
+    for line in proxycheck.summarize(results):
+        print(f"  {line}")
+    if args.out:
+        _write_check_results(args.out, results)
+        print(f"\n  {args.out} 에 기록했다. 시간을 두고 다시 돌린 뒤 proxy-sticky 로 비교할 것.")
+    return EXIT_OK if all(r.ok for r in results) else EXIT_FAIL
+
+
+def cmd_proxy_sticky(args: argparse.Namespace) -> int:
+    """두 번의 proxy-check 결과를 비교해 sticky 유지 여부를 본다."""
+    before = _read_check_results(args.before)
+    after = _read_check_results(args.after)
+    for line in proxycheck.compare_runs(before, after):
+        print(f"  {line}")
+    return EXIT_OK
+
+
+def _write_check_results(path: str, results: list[proxycheck.CheckResult]) -> None:
+    import csv
+
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["group_id", "ok", "egress_ip", "elapsed_ms", "error"])
+        writer.writeheader()
+        for r in results:
+            writer.writerow(
+                {"group_id": r.group_id, "ok": "1" if r.ok else "0", "egress_ip": r.egress_ip, "elapsed_ms": str(r.elapsed_ms), "error": r.error}
+            )
+
+
+def _read_check_results(path: str) -> list[proxycheck.CheckResult]:
+    import csv
+
+    p = Path(path)
+    if not p.exists():
+        raise csvio.CsvError(f"파일이 없다: {p}")
+    with p.open("r", encoding="utf-8-sig", newline="") as fh:
+        return [
+            proxycheck.CheckResult(
+                group_id=row.get("group_id", ""),
+                ok=row.get("ok") == "1",
+                egress_ip=row.get("egress_ip", ""),
+                error=row.get("error", ""),
+            )
+            for row in csv.DictReader(fh)
+            if row.get("group_id")
+        ]
+
+
 def _add_capacity_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--minutes", type=float, default=20.0, help="1인당 월 접속 시간(분). 기본 20")
     p.add_argument("--mbps", type=float, default=capacity.BITRATE_MBPS["1080p"], help="스트림 비트레이트(Mbps). 기본 5.0 (1080p)")
@@ -304,6 +430,37 @@ def build_parser() -> argparse.ArgumentParser:
     _add_tunnel_args(p)
     p.set_defaults(func=cmd_wg)
 
+    p = sub.add_parser("proxy-export", help="레지덴셜 프록시 경로용 서버·사용자 설정을 내보낸다")
+    p.add_argument("--assignments", required=True)
+    p.add_argument("--proxies", required=True, help="업스트림 프록시 CSV (host, port 컬럼 필요)")
+    p.add_argument("--entry-host", required=True, help="사용자가 접속할 진입 호스트. 공인 IP 1개면 된다")
+    p.add_argument("--entry-port", type=int, default=51820)
+    p.add_argument("--out", default="out/proxy")
+    p.add_argument("--wg-interface", default="wg0")
+    p.add_argument("--redsocks-base-port", type=int, default=proxychain.DEFAULT_REDSOCKS_BASE_PORT)
+    p.add_argument("--allowed-ips", default=wireguard.DEFAULT_ALLOWED_IPS)
+    p.add_argument("--dns", default=wireguard.DEFAULT_DNS, help="사용자 설정의 DNS. 프록시를 타지 않고 진입 호스트 경로로 나간다")
+    p.add_argument("--mtu", type=int, default=wireguard.DEFAULT_MTU)
+    p.add_argument("--salt", default="", help="바꾸면 전 묶음의 sticky 세션이 한꺼번에 갈린다")
+    _add_tunnel_args(p)
+    p.set_defaults(func=cmd_proxy_export)
+
+    p = sub.add_parser("proxy-check", help="묶음별 실제 출구 IP 를 확인한다 (네트워크 필요)")
+    p.add_argument("--assignments", required=True)
+    p.add_argument("--proxies", required=True)
+    p.add_argument("--echo-url", default=proxycheck.DEFAULT_ECHO_URL, help="출구 IP 를 돌려주는 http:// URL. 자체 엔드포인트를 쓰는 편이 정확하다")
+    p.add_argument("--timeout", type=float, default=proxycheck.DEFAULT_TIMEOUT)
+    p.add_argument("--limit", type=int, default=0, help="앞에서 N개 묶음만 확인한다. 0 이면 전부")
+    p.add_argument("--salt", default="")
+    p.add_argument("--out", help="결과를 CSV 로 기록한다. proxy-sticky 비교에 쓴다")
+    _add_tunnel_args(p)
+    p.set_defaults(func=cmd_proxy_check)
+
+    p = sub.add_parser("proxy-sticky", help="두 번의 proxy-check 결과를 비교해 sticky 유지 여부를 본다")
+    p.add_argument("--before", required=True)
+    p.add_argument("--after", required=True)
+    p.set_defaults(func=cmd_proxy_sticky)
+
     return parser
 
 
@@ -318,6 +475,9 @@ def main(argv: list[str] | None = None) -> int:
         allocator.AllocationError,
         capacity.CapacityError,
         cost.CostError,
+        proxy.ProxyError,
+        proxychain.ProxyChainError,
+        proxycheck.ProxyCheckError,
     ) as exc:
         print(f"오류: {exc}", file=sys.stderr)
         return EXIT_FAIL
