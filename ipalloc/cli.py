@@ -131,7 +131,41 @@ def cmd_cost(args: argparse.Namespace) -> int:
     else:
         print(f"  손익분기 GB 단가: {be:.4f}")
         print(f"  이보다 싼 종량 단가를 받아야 레지덴셜이 유리하다. 현재 넣은 단가는 {args.res_per_gb:.4f} 다.")
+
+    if args.scale:
+        _print_scale(args, transfer_gb)
     return EXIT_OK
+
+
+def _print_scale(args: argparse.Namespace, transfer_gb: float) -> None:
+    """IP 개수를 바꿔가며 두 과금 모델을 비교한다."""
+    fixed_prices = cost.PriceBook(
+        ip_monthly=args.dc_ip_monthly,
+        host_monthly=args.dc_host_monthly,
+        hosts=args.dc_hosts,
+        egress_per_gb=args.dc_egress_per_gb,
+    )
+    metered_prices = cost.PriceBook(
+        ip_monthly=args.res_ip_monthly,
+        host_monthly=args.dc_host_monthly,
+        hosts=args.dc_hosts,
+        per_gb=args.res_per_gb,
+    )
+    rows = cost.scale(args.users, args.scale, transfer_gb=transfer_gb, fixed_prices=fixed_prices, metered_prices=metered_prices)
+
+    print("\n[IP 개수를 늘렸을 때]")
+    print("  전체 트래픽은 묶음 정원과 무관하다 — 같은 사람들을 몇 명씩 묶든 총 사용량은 같다.")
+    print(f"  그래서 종량제 총액은 IP 개수와 무관하게 일정하고(월 {transfer_gb:,.0f} GB), 월정액만 정비례한다.\n")
+    print("  묶음당   출구IP   데이터센터    레지덴셜종량   싼 쪽")
+    for row in rows:
+        print(f"  {row.per_ip:>5}명  {row.ip_count:>5}개  {row.fixed_total:>10,.2f}  {row.metered_total:>12,.2f}   {row.cheaper}")
+
+    crossover = cost.crossover_ip_count(fixed_prices, metered_prices, transfer_gb=transfer_gb)
+    if crossover is None:
+        print("\n  IP 단가 차이가 없어 교차점이 없다.")
+    else:
+        print(f"\n  교차점: 출구 IP {crossover}개부터 종량제가 싸다.")
+        print("  IP 를 많이 받아야 하는 설계면 종량제가 구조적으로 유리하다 — 요구사항이 이쪽이면 종량제다.")
 
 
 def cmd_sample_users(args: argparse.Namespace) -> int:
@@ -391,6 +425,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dc-egress-per-gb", type=float, default=0.0, help="전송량 GB 당 단가. 전송량 포함 VPS 면 0")
     p.add_argument("--res-per-gb", type=float, default=0.0, help="레지덴셜 종량 GB 당 단가")
     p.add_argument("--res-ip-monthly", type=float, default=0.0, help="static ISP 프록시처럼 IP 월정액이 있는 경우")
+    p.add_argument(
+        "--scale",
+        type=int,
+        nargs="+",
+        metavar="N",
+        help="비교할 묶음 정원들. 예: --scale 5 10 20 50 → IP 개수를 늘렸을 때 두 과금 모델이 어떻게 갈리는지 본다",
+    )
     _add_tunnel_args(p)
     _add_capacity_args(p)
     p.set_defaults(func=cmd_cost)

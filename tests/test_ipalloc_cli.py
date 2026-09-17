@@ -76,6 +76,20 @@ class CostTest(CliTestCase):
         self.assertEqual(code, 1)
         self.assertIn("--dc-ip-monthly", text)
 
+    def test_scale_shows_metered_is_flat_and_names_the_crossover(self) -> None:
+        # 1인당 100MB / 60분 → 전체 월 100GB
+        code, text = run(
+            *self.ARGS, "--minutes", "60", "--mbps", "0.2222", "--dc-egress-per-gb", "0.09", "--res-per-gb", "2.0",
+            "--scale", "5", "10", "20", "50",
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("월 전송량 100 GB", text)
+        # 스케일 표에서 종량 총액이 네 줄 모두 같아야 한다. (위쪽 합계까지 세지 않도록 구간을 자른다)
+        table = text.split("[IP 개수를 늘렸을 때]", 1)[1]
+        self.assertEqual(table.count("239.98"), 4)
+        self.assertIn("교차점: 출구 IP 54개부터 종량제가 싸다", text)
+        self.assertIn("200개", text)  # 묶음당 5명
+
     def test_says_when_fixed_cost_alone_already_loses(self) -> None:
         # 레지덴셜에 IP 월정액까지 붙으면 GB 단가가 0이어도 못 이기는 경우가 나온다.
         code, text = run("cost", "--users", "1000", "--per-ip", "20", "--dc-ip-monthly", "1.0", "--res-ip-monthly", "20.0")

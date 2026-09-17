@@ -110,6 +110,85 @@ def breakeven_per_gb(target_total: float, fixed_cost: float, transfer_gb: float)
     return margin / transfer_gb
 
 
+@dataclass(frozen=True)
+class ScaleRow:
+    """IP 개수를 바꿔 봤을 때의 한 줄."""
+
+    per_ip: int
+    ip_count: int
+    fixed_total: float
+    metered_total: float
+
+    @property
+    def cheaper(self) -> str:
+        if self.metered_total < self.fixed_total:
+            return "종량"
+        if self.fixed_total < self.metered_total:
+            return "IP월정액"
+        return "동일"
+
+
+def scale(
+    user_count: int,
+    per_ip_values: list[int],
+    *,
+    transfer_gb: float,
+    fixed_prices: PriceBook,
+    metered_prices: PriceBook,
+) -> list[ScaleRow]:
+    """묶음 정원을 바꿔가며 두 과금 모델의 총액을 비교한다.
+
+    여기서 드러나는 핵심은 이것이다. **전체 트래픽은 묶음 정원과 무관하다.**
+    사용자 1인당 사용량이 정해져 있으면, 그 사람들을 몇 명씩 묶든 총 전송량은
+    같다. 따라서
+
+        종량 과금  → IP 개수와 무관하게 총액이 일정하다 (선형 증가하지 않는다)
+        IP 월정액  → IP 개수에 정비례한다
+
+    IP 를 많이 받아야 하는 설계라면 종량제가 구조적으로 유리하고, 적게 받아도
+    되는 설계라면 월정액이 유리하다. 손익분기는 IP 개수에서 갈린다.
+    """
+    if user_count < 1:
+        raise CostError("사용자 수는 1 이상이어야 한다.")
+    if not per_ip_values:
+        raise CostError("비교할 묶음 정원을 하나 이상 지정해야 한다.")
+
+    rows: list[ScaleRow] = []
+    for per_ip in sorted(set(per_ip_values)):
+        if per_ip < 1:
+            raise CostError("묶음 정원은 1 이상이어야 한다.")
+        ip_count = -(-user_count // per_ip)
+        rows.append(
+            ScaleRow(
+                per_ip=per_ip,
+                ip_count=ip_count,
+                fixed_total=estimate("f", ip_count=ip_count, transfer_gb=transfer_gb, prices=fixed_prices).total,
+                metered_total=estimate("m", ip_count=ip_count, transfer_gb=transfer_gb, prices=metered_prices).total,
+            )
+        )
+    return rows
+
+
+def crossover_ip_count(fixed_prices: PriceBook, metered_prices: PriceBook, *, transfer_gb: float) -> int | None:
+    """종량제가 월정액보다 싸지기 시작하는 IP 개수.
+
+    월정액 총액 = ip_count * ip_monthly + 고정비 + 전송량비
+    종량 총액   = ip_count * res_ip_monthly + 고정비 + 전송량비  (보통 res_ip_monthly = 0)
+
+    두 식을 같게 놓고 ip_count 를 구한다. IP 단가 차이가 없으면 교차점이
+    없으므로 None 을 돌려준다.
+    """
+    slope = fixed_prices.ip_monthly - metered_prices.ip_monthly
+    if slope <= 0:
+        return None
+    fixed_side = fixed_prices.hosts * fixed_prices.host_monthly + transfer_gb * (fixed_prices.egress_per_gb + fixed_prices.per_gb)
+    metered_side = metered_prices.hosts * metered_prices.host_monthly + transfer_gb * (metered_prices.egress_per_gb + metered_prices.per_gb)
+    gap = metered_side - fixed_side
+    if gap <= 0:
+        return 1  # 고정비까지 종량제가 싸다 — IP 1개부터 이긴다
+    return int(gap // slope) + 1
+
+
 def compare(baseline: Estimate, candidate: Estimate) -> list[str]:
     """두 견적을 비교해 사람이 읽는 판정을 만든다."""
     out: list[str] = []
@@ -130,7 +209,10 @@ __all__ = [
     "CostError",
     "Estimate",
     "PriceBook",
+    "ScaleRow",
     "breakeven_per_gb",
     "compare",
+    "crossover_ip_count",
     "estimate",
+    "scale",
 ]
