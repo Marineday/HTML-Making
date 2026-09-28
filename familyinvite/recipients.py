@@ -48,6 +48,9 @@ def normalize_phone(raw: str) -> str:
     digits = re.sub(r"\D", "", raw or "")
     if digits.startswith("82"):
         digits = "0" + digits[2:].lstrip("0")
+    elif re.fullmatch(r"1[016789]\d{7,8}", digits):
+        # 엑셀이 숫자로 읽어 앞자리 0 을 지운 경우 (010-1234-5678 → 1012345678)
+        digits = "0" + digits
     if not _MOBILE.match(digits):
         raise RecipientError(f"휴대폰 번호 형식이 아닙니다: {raw!r}")
     return digits

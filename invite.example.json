@@ -16,7 +16,7 @@
   // 공통 링크. 명단의 link 열이 있으면 그 사람에게는 그 링크가 나간다.
   "link": "https://example.com/replace-me",
 
-  // 자리표시자: {name} {link} {month} {year} {memo}
+  // 자리표시자: {name} {link} {link_noscheme} {month} {year} {memo}
   // 문자는 EUC-KR 90바이트(한글 약 45자)를 넘으면 LMS 요금이 붙는다. check 로 확인.
   "message": "[{month}월 초대] {name}님, 이번 달 링크입니다.\n{link}",
 
@@ -42,7 +42,7 @@
       // "from": "01000000000"            // 솔라피 콘솔에 사전등록한 발신번호
     },
 
-    // 카카오 알림톡: 비즈니스 채널 + 심사 통과 템플릿 필요. 본문은 템플릿 그대로 나가고
+    // 카카오 알림톡: 비즈니스 인증 채널 + 심사 통과 템플릿 필요. 본문은 템플릿 그대로 나가고
     // message 는 쓰지 않는다. 템플릿 변수에 우리 자리표시자를 채운다.
     "kakao": {
       "provider": "console",
@@ -53,7 +53,10 @@
       // "pf_id": "KA01PF...",             // 솔라피에 연동한 카카오 채널 ID
       // "template_id": "KA01TP...",
       // "sms_fallback": true,             // 카톡 실패 시 문자로 대체발송
-      "variables": { "#{이름}": "{name}", "#{링크}": "{link}", "#{월}": "{month}" }
+      // 템플릿 변수와 정확히 같아야 한다 (invite.py solapi-check 로 확인).
+      // 버튼 링크를 https://#{링크} 로 등록했다면 {link_noscheme} (https:// 뺀 링크)를 쓴다.
+      // 절차: docs/kakao-alimtalk.md  (⚠️ 비즈니스 인증 채널 = 사업자등록 필요)
+      "variables": { "#{이름}": "{name}", "#{월}": "{month}", "#{링크}": "{link_noscheme}" }
     },
 
     // 텔레그램: 수신자가 봇에 /start 후 번호를 공유해야 발송 가능 (invite.py telegram-link)

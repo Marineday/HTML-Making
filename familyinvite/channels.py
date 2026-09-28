@@ -16,44 +16,94 @@ import hmac
 import json
 import re
 import secrets
+import socket
+import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Callable, Protocol
 
 from .recipients import Recipient
 
-SOLAPI_SEND_URL = "https://api.solapi.com/messages/v4/send-many/detail"
+SOLAPI_BASE = "https://api.solapi.com"
+SOLAPI_SEND_URL = f"{SOLAPI_BASE}/messages/v4/send-many/detail"
 TELEGRAM_API = "https://api.telegram.org"
 USER_AGENT = "familyinvite/0.1"
 
 #: (url, json body, headers) -> 파싱된 JSON 응답. 테스트에서 가짜로 갈아끼운다.
 Transport = Callable[[str, dict[str, Any], dict[str, str]], dict[str, Any]]
+#: (url, headers) -> 파싱된 JSON 응답. 조회 전용.
+GetTransport = Callable[[str, dict[str, str]], dict[str, Any]]
+
+#: 알림톡 변수 키 형식. 공식 SDK 와 같은 규칙: #{...} 이고 이름에 점(.)이 없어야 한다.
+_ALIMTALK_VARIABLE = re.compile(r"^#\{[^.{}]+\}$")
 
 
 class ChannelError(RuntimeError):
-    """발송 실패. 러너는 이걸 잡아 기록하고 다음 사람으로 넘어간다."""
+    """발송 실패. 러너는 이걸 잡아 기록하고 다음 사람으로 넘어간다.
+
+    ambiguous=True 는 "상대 서버가 받았는지 알 수 없음"(타임아웃, 5xx, 응답 중 끊김).
+    이 경우 자동 재시도하면 두 통이 나갈 수 있어서, 러너는 재시도하지 않고
+    사람에게 확인을 넘긴다. 4xx·접수 거부·연결 자체 실패는 확실히 안 나간 것이다.
+    """
+
+    def __init__(self, message: str, *, ambiguous: bool = False) -> None:
+        super().__init__(message)
+        self.ambiguous = ambiguous
+
+
+def _definitely_not_sent(reason: object) -> bool:
+    """요청이 서버에 닿기 전에 실패했는가 (DNS 실패, 연결 거부, TLS 핸드셰이크 실패)."""
+    return isinstance(reason, (socket.gaierror, ConnectionRefusedError, ssl.SSLError))
+
+
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    raw = exc.read().decode("utf-8", errors="replace")
+    # 솔라피 4xx 본문은 {"errorCode": "...", "errorMessage": "..."} 형식이다 (공식 SDK 기준).
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw[:300]
+    if isinstance(body, dict) and body.get("errorCode"):
+        return f"{body['errorCode']}: {body.get('errorMessage', '')}"[:300]
+    if isinstance(body, dict) and body.get("description"):  # 텔레그램
+        return str(body["description"])[:300]
+    return raw[:300]
+
+
+def _open_json(request: urllib.request.Request, timeout: float) -> dict[str, Any]:
+    request.add_header("User-Agent", USER_AGENT)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        # 4xx: 서버가 거부 → 확실히 안 나감. 5xx: 처리 중 죽었을 수 있음 → 모름.
+        raise ChannelError(f"HTTP {exc.code}: {_http_error_detail(exc)}", ambiguous=exc.code >= 500) from None
+    except urllib.error.URLError as exc:
+        raise ChannelError(f"네트워크 오류: {exc.reason}", ambiguous=not _definitely_not_sent(exc.reason)) from None
+    except (TimeoutError, OSError) as exc:
+        raise ChannelError(f"네트워크 오류: {exc!r}", ambiguous=True) from None
+    try:
+        return json.loads(raw or b"{}")
+    except json.JSONDecodeError as exc:
+        # 200 은 받았으니 접수는 됐을 가능성이 크다.
+        raise ChannelError(f"응답 파싱 실패: {exc}", ambiguous=True) from None
 
 
 def http_post_json(url: str, body: dict[str, Any], headers: dict[str, str], timeout: float = 15.0) -> dict[str, Any]:
     request = urllib.request.Request(url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"), method="POST")
     request.add_header("Content-Type", "application/json; charset=utf-8")
-    request.add_header("User-Agent", USER_AGENT)
     for key, value in headers.items():
         request.add_header(key, value)
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read()
-    except urllib.error.HTTPError as exc:
-        # 솔라피는 "발신번호 미등록" 같은 이유를 본문에 담아 준다. 버리면 원인을 알 수 없다.
-        detail = exc.read().decode("utf-8", errors="replace")[:300]
-        raise ChannelError(f"HTTP {exc.code}: {detail}") from None
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise ChannelError(f"네트워크 오류: {exc}") from None
-    try:
-        return json.loads(raw or b"{}")
-    except json.JSONDecodeError as exc:
-        raise ChannelError(f"응답 파싱 실패: {exc}") from None
+    return _open_json(request, timeout)
+
+
+def http_get_json(url: str, headers: dict[str, str], timeout: float = 15.0) -> dict[str, Any]:
+    request = urllib.request.Request(url, method="GET")
+    for key, value in headers.items():
+        request.add_header(key, value)
+    return _open_json(request, timeout)
 
 
 class Channel(Protocol):
@@ -111,11 +161,13 @@ class _SolapiBase:
 
     def _send_one(self, message: dict[str, Any]) -> str:
         headers = {"Authorization": solapi_auth_header(self.api_key, self.api_secret)}
+        # showMessageList 가 없으면 응답에 messageList(메시지 ID)가 빠진다 (공식 SDK 기본값 false).
+        # 한 요청에 한 통만 보낸다 — 부분 실패를 사람 단위로 정확히 기록하기 위해서다.
         try:
-            body = self._post(SOLAPI_SEND_URL, {"messages": [message]}, headers)
+            body = self._post(SOLAPI_SEND_URL, {"messages": [message], "showMessageList": True}, headers)
         except ChannelError as exc:
             # API 키가 오류 메시지로 새지 않게 한다.
-            raise ChannelError(str(exc).replace(self.api_secret, "***")) from None
+            raise ChannelError(str(exc).replace(self.api_secret, "***"), ambiguous=exc.ambiguous) from None
 
         failed = body.get("failedMessageList") or []
         if failed:
@@ -138,7 +190,8 @@ class SolapiSmsChannel(_SolapiBase):
     where = "sms"
 
     def send(self, recipient: Recipient, text: str, variables: dict[str, str]) -> str:
-        return self._send_one({"to": recipient.phone, "from": self.sender, "text": text})
+        # autoTypeDetect: 90바이트 이하 SMS, 초과 LMS 를 솔라피가 고른다 (공식 SDK 기본값 true)
+        return self._send_one({"to": recipient.phone, "from": self.sender, "text": text, "autoTypeDetect": True})
 
 
 class SolapiAlimtalkChannel(_SolapiBase):
@@ -158,6 +211,9 @@ class SolapiAlimtalkChannel(_SolapiBase):
         self.pf_id = _require(options, "pf_id", "kakao")
         self.template_id = _require(options, "template_id", "kakao")
         self.variable_map: dict[str, str] = dict(options.get("variables") or {})
+        bad = [key for key in self.variable_map if not _ALIMTALK_VARIABLE.match(key)]
+        if bad:
+            raise ChannelError(f"channels.kakao.variables 의 키는 #{{변수명}} 형식이어야 하고 점(.)을 쓸 수 없습니다: {bad}")
         # 알림톡 실패(카톡 미사용자 등) 시 같은 내용을 문자로 대체발송할지
         self.sms_fallback = bool(options.get("sms_fallback", True))
 
@@ -175,6 +231,58 @@ class SolapiAlimtalkChannel(_SolapiBase):
                 },
             }
         )
+
+
+class SolapiInspector:
+    """발송 전 점검용 조회 API (잔액, 알림톡 템플릿). 발송은 하지 않는다."""
+
+    def __init__(self, options: dict[str, Any], transport: GetTransport = http_get_json) -> None:
+        self.api_key = _require(options, "api_key", "sms/kakao")
+        self.api_secret = _require(options, "api_secret", "sms/kakao")
+        self._get = transport
+
+    def _call(self, path: str) -> dict[str, Any]:
+        headers = {"Authorization": solapi_auth_header(self.api_key, self.api_secret)}
+        try:
+            return self._get(f"{SOLAPI_BASE}/{path}", headers)
+        except ChannelError as exc:
+            raise ChannelError(str(exc).replace(self.api_secret, "***")) from None
+
+    def balance(self) -> tuple[float, float]:
+        """(잔액, 포인트). GET /cash/v1/balance"""
+        body = self._call("cash/v1/balance")
+        return float(body.get("balance", 0) or 0), float(body.get("point", 0) or 0)
+
+    def template(self, template_id: str) -> dict[str, Any]:
+        """GET /kakao/v2/templates/{templateId} — status, content, variables[{name}] 등"""
+        return self._call(f"kakao/v2/templates/{urllib.parse.quote(template_id, safe='')}")
+
+
+def check_alimtalk_template(template: dict[str, Any], variable_map: dict[str, str], pf_id: str) -> list[str]:
+    """템플릿과 설정이 맞지 않는 점을 사람이 읽을 문장으로 돌려준다. 빈 리스트면 OK.
+
+    알림톡 실패의 대부분은 "승인 안 된 템플릿"과 "변수 불일치"다. 발송일에 알게
+    되면 늦으니 check 단계에서 미리 잡는다.
+    """
+    problems: list[str] = []
+    status = template.get("status")
+    if status != "APPROVED":
+        problems.append(f"템플릿 상태가 {status} 입니다 — APPROVED(승인)여야 발송됩니다")
+    names = {str(v.get("name", "")) for v in template.get("variables") or [] if isinstance(v, dict)}
+    # 응답의 변수 이름이 '#{이름}' 형태인지 '이름' 형태인지 SDK 로는 확정할 수 없어 둘 다 받아준다.
+    template_keys = {n if n.startswith("#{") else f"#{{{n}}}" for n in names if n}
+    configured = set(variable_map)
+    if template_keys and template_keys != configured:
+        missing = sorted(template_keys - configured)
+        extra = sorted(configured - template_keys)
+        if missing:
+            problems.append(f"설정에 없는 템플릿 변수: {missing}")
+        if extra:
+            problems.append(f"템플릿에 없는 설정 변수: {extra}")
+    channel = template.get("channelId")
+    if channel and pf_id and channel != pf_id:
+        problems.append(f"템플릿의 채널({channel})과 설정의 pf_id({pf_id})가 다릅니다")
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +318,7 @@ def send_telegram(token: str, chat_id: str, text: str, transport: Transport = ht
     try:
         result = transport(f"{TELEGRAM_API}/bot{token}/sendMessage", body, {})
     except ChannelError as exc:
-        raise ChannelError(str(exc).replace(token, "***")) from None
+        raise ChannelError(str(exc).replace(token, "***"), ambiguous=exc.ambiguous) from None
     if not result.get("ok"):
         raise ChannelError(f"텔레그램 API 오류: {result.get('description', result)}")
     return str((result.get("result") or {}).get("message_id", ""))

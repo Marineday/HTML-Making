@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 
 SENT = "sent"
 FAILED = "failed"
+#: 타임아웃·5xx 등으로 상대가 받았는지 모름. 자동 재시도하지 않는다 (중복 발송 방지).
+UNKNOWN = "unknown"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sends (
@@ -86,8 +88,12 @@ class Store:
         ).fetchall()
         return [SendRecord(*row) for row in rows]
 
-    def record(self, period: str, phone: str, name: str, channel: str, *, ok: bool, message_id: str = "", error: str = "") -> None:
+    def record(
+        self, period: str, phone: str, name: str, channel: str, *,
+        ok: bool, message_id: str = "", error: str = "", ambiguous: bool = False,
+    ) -> None:
         """시도 1회를 기록한다. 성공이든 실패든 attempts 가 1 오른다."""
+        status = SENT if ok else (UNKNOWN if ambiguous else FAILED)
         with self.conn:
             self.conn.execute(
                 """
@@ -98,7 +104,7 @@ class Store:
                     attempts = sends.attempts + 1, message_id = excluded.message_id,
                     error = excluded.error, updated_at = excluded.updated_at
                 """,
-                (period, phone, name, channel, SENT if ok else FAILED, message_id, error[:500], _now()),
+                (period, phone, name, channel, status, message_id, error[:500], _now()),
             )
 
     def reset(self, period: str, phone: str | None = None) -> int:

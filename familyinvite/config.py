@@ -18,7 +18,7 @@ from hotdeal.config import ConfigError, _expand_env, strip_comments
 from .recipients import CHANNELS
 
 #: 메시지 템플릿에서 쓸 수 있는 자리표시자
-PLACEHOLDERS = ("name", "link", "month", "year", "memo")
+PLACEHOLDERS = ("name", "link", "link_noscheme", "month", "year", "memo")
 
 
 @dataclass(slots=True)

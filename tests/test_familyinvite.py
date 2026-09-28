@@ -37,6 +37,9 @@ class PhoneTest(unittest.TestCase):
         for raw in ("010-1234-5678", "01012345678", "+82 10 1234 5678", "821012345678", "+82-010-1234-5678"):
             self.assertEqual(normalize_phone(raw), "01012345678", raw)
 
+    def test_excel_dropped_leading_zero(self):
+        self.assertEqual(normalize_phone("1012345678"), "01012345678")
+
     def test_old_ten_digit_mobile(self):
         self.assertEqual(normalize_phone("011-123-4567"), "0111234567")
 
@@ -130,7 +133,8 @@ class SolapiTest(unittest.TestCase):
         message_id = channels.SolapiSmsChannel(self.OPTIONS, fake).send(self.R, "안녕", {})
         url, body, headers = fake.calls[0]
         self.assertEqual(url, channels.SOLAPI_SEND_URL)
-        self.assertEqual(body, {"messages": [{"to": "01012345678", "from": "021234567", "text": "안녕"}]})
+        self.assertEqual(body, {"messages": [{"to": "01012345678", "from": "021234567", "text": "안녕", "autoTypeDetect": True}],
+                                "showMessageList": True})
         self.assertTrue(headers["Authorization"].startswith("HMAC-SHA256 apiKey=KEY,"))
         self.assertNotIn("SECRET", headers["Authorization"])
         self.assertEqual(message_id, "M1")
@@ -161,9 +165,95 @@ class SolapiTest(unittest.TestCase):
                                                    "variables": {"#{이름}": "홍길동", "#{링크}": "https://l"}, "disableSms": True})
         self.assertEqual(message_id, "G1")
 
+    def test_alimtalk_rejects_bad_variable_keys(self):
+        for key in ("이름", "#{a.b}"):
+            options = {**self.OPTIONS, "pf_id": "PF", "template_id": "TP", "variables": {key: "{name}"}}
+            with self.assertRaisesRegex(ChannelError, "variables"):
+                channels.SolapiAlimtalkChannel(options, FakeTransport())
+
+    def test_ambiguous_flag_survives_secret_masking(self):
+        fake = FakeTransport(ChannelError("HTTP 502 SECRET", ambiguous=True))
+        with self.assertRaises(ChannelError) as ctx:
+            channels.SolapiSmsChannel(self.OPTIONS, fake).send(self.R, "x", {})
+        self.assertTrue(ctx.exception.ambiguous)
+
+    def test_inspector_balance_and_template(self):
+        calls = []
+
+        def fake_get(url, headers):
+            calls.append(url)
+            return {"balance": 1234.5, "point": 10} if url.endswith("balance") else {"status": "APPROVED"}
+
+        inspector = channels.SolapiInspector(self.OPTIONS, fake_get)
+        self.assertEqual(inspector.balance(), (1234.5, 10.0))
+        self.assertEqual(inspector.template("KA01TP 1")["status"], "APPROVED")
+        self.assertEqual(calls, [f"{channels.SOLAPI_BASE}/cash/v1/balance", f"{channels.SOLAPI_BASE}/kakao/v2/templates/KA01TP%201"])
+
+    def test_check_alimtalk_template(self):
+        variables = {"#{이름}": "{name}", "#{링크}": "{link}"}
+        ok = {"status": "APPROVED", "channelId": "PF", "variables": [{"name": "이름"}, {"name": "#{링크}"}]}
+        self.assertEqual(channels.check_alimtalk_template(ok, variables, "PF"), [])
+        bad = {"status": "INSPECTING", "channelId": "OTHER", "variables": [{"name": "이름"}, {"name": "월"}]}
+        problems = " / ".join(channels.check_alimtalk_template(bad, variables, "PF"))
+        for fragment in ("INSPECTING", "#{월}", "#{링크}", "OTHER"):
+            self.assertIn(fragment, problems)
+
     def test_build_rejects_unknown_provider(self):
         with self.assertRaisesRegex(ChannelError, "provider"):
             channels.build("sms", {"provider": "twilio"}, lookup_chat_id=lambda _: None)
+
+
+class HttpClassificationTest(unittest.TestCase):
+    """실제 로컬 소켓으로 '확실히 안 나감' 과 '모름' 을 가르는지 확인한다."""
+
+    def serve(self, status, body):
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                payload = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}/x"
+
+    def test_4xx_is_definite_and_parses_solapi_error(self):
+        url = self.serve(400, {"errorCode": "ValidationError", "errorMessage": "발신번호 미등록"})
+        with self.assertRaises(ChannelError) as ctx:
+            channels.http_post_json(url, {}, {})
+        self.assertFalse(ctx.exception.ambiguous)
+        self.assertIn("ValidationError: 발신번호 미등록", str(ctx.exception))
+
+    def test_5xx_is_ambiguous(self):
+        with self.assertRaises(ChannelError) as ctx:
+            channels.http_post_json(self.serve(502, {}), {}, {})
+        self.assertTrue(ctx.exception.ambiguous)
+
+    def test_connection_refused_is_definite(self):
+        import socket
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        with self.assertRaises(ChannelError) as ctx:
+            channels.http_post_json(f"http://127.0.0.1:{port}/x", {}, {}, timeout=2)
+        self.assertFalse(ctx.exception.ambiguous)
+
+    def test_success_returns_json(self):
+        self.assertEqual(channels.http_post_json(self.serve(200, {"ok": True}), {}, {}), {"ok": True})
 
 
 class TelegramChannelTest(unittest.TestCase):
@@ -250,6 +340,38 @@ class RunnerTest(StoreMixin, unittest.TestCase):
         self.assertEqual((report.failed, report.gave_up), ([], ["김철수"]))
         self.assertIn("재시도 한도 초과", report.summary())
 
+    def test_ambiguous_failure_is_not_retried(self):
+        class Timeout(RecordingChannel):
+            def send(self, recipient, text, variables):
+                raise ChannelError("timed out", ambiguous=True)
+
+        report, _ = self.run_once(make_cfg(max_attempts=5), Timeout())
+        self.assertEqual((report.unknown, report.failed), (["홍길동", "김철수"], []))
+        channel = RecordingChannel()
+        report, _ = self.run_once(make_cfg(max_attempts=5), channel)
+        self.assertEqual((channel.sent, report.unknown), ([], ["홍길동", "김철수"]))
+        self.assertIn("전송 여부 불명", report.summary())
+        self.store.reset("2026-10", "01011111111")
+        self.run_once(make_cfg(), channel)
+        self.assertEqual([p for p, _ in channel.sent], ["01011111111"])
+
+    def test_unexpected_exception_counts_as_unknown(self):
+        class Broken(RecordingChannel):
+            def send(self, recipient, text, variables):
+                raise KeyError("x")
+
+        import logging
+
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        report, _ = self.run_once(make_cfg(), Broken())
+        self.assertEqual(report.unknown, ["홍길동", "김철수"])
+
+    def test_link_noscheme_placeholder(self):
+        _, variables = runner.render(make_cfg(), self.PEOPLE[1], "2026-10")
+        self.assertEqual(variables["link_noscheme"], "own")
+        self.assertEqual(runner.render(make_cfg(message="{link_noscheme}"), self.PEOPLE[0], "2026-10")[0], "example.com/x")
+
     def test_dry_run_records_nothing(self):
         channel = RecordingChannel()
         self.run_once(make_cfg(), channel, dry_run=True)
@@ -276,6 +398,7 @@ class RunnerTest(StoreMixin, unittest.TestCase):
     def test_message_kind(self):
         self.assertEqual(runner.message_kind("가" * 45), "SMS 90B")
         self.assertEqual(runner.message_kind("가" * 46), "LMS 92B")
+        self.assertIn("초과", runner.message_kind("가" * 1001))
 
     def test_approval_flags(self):
         self.assertFalse(self.store.is_approved("2026-10"))
@@ -373,6 +496,25 @@ class CliTest(unittest.TestCase):
         self.assertIn("성공 1명", out)
         code, out = self.invite("send", "--period", "2026-10")
         self.assertNotIn("홍길동님", out)
+
+    def test_concurrent_send_is_refused(self):
+        import fcntl
+
+        with open(Path(self.tmp.name) / "i.lock", "w") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            import contextlib
+            import io
+
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                code, _ = self.invite("send", "--period", "2026-10")
+        self.assertEqual(code, 2)
+        self.assertIn("다른 send", err.getvalue())
+
+    def test_solapi_check_without_solapi_routes(self):
+        code, out = self.invite("solapi-check")
+        self.assertEqual(code, 0)
+        self.assertIn("솔라피를 쓰는 경로", out)
 
     def test_rejects_bad_period(self):
         self.assertEqual(self.invite("status", "--period", "2026-13")[0], 2)

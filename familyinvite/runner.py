@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -18,13 +19,18 @@ from typing import Callable
 from .channels import Channel, ChannelError
 from .config import InviteConfig
 from .recipients import Recipient
-from .store import SENT, Store
+from .store import SENT, UNKNOWN, Store
 
 log = logging.getLogger(__name__)
 
 PENDING = "pending"
 DONE = "done"
 GAVE_UP = "gave_up"
+#: 전송 여부 불명 — 사람이 솔라피 콘솔 등에서 확인하고 reset 해야 재발송된다.
+UNKNOWN_STATE = "unknown"
+
+#: LMS 최대 길이(EUC-KR 2,000바이트). 넘으면 접수가 거부된다.
+LMS_MAX_BYTES = 2000
 
 
 def period_of(now: datetime) -> str:
@@ -38,9 +44,12 @@ def is_due(cfg: InviteConfig, now: datetime) -> bool:
 
 def render(cfg: InviteConfig, recipient: Recipient, period: str) -> tuple[str, dict[str, str]]:
     year, month = period.split("-")
+    link = recipient.link or cfg.link
     variables = {
         "name": recipient.name,
-        "link": recipient.link or cfg.link,
+        "link": link,
+        # 알림톡 웹링크 버튼은 https:// 를 고정으로 등록하고 나머지만 변수로 받는다.
+        "link_noscheme": re.sub(r"^https?://", "", link),
         "month": str(int(month)),
         "year": year,
         "memo": recipient.memo,
@@ -51,6 +60,8 @@ def render(cfg: InviteConfig, recipient: Recipient, period: str) -> tuple[str, d
 def message_kind(text: str) -> str:
     """국내 문자 기준: EUC-KR 90바이트 이하 SMS, 초과 LMS. 요금이 다르다."""
     size = len(text.encode("cp949", errors="replace"))
+    if size > LMS_MAX_BYTES:
+        return f"⚠️ {size}B — LMS 한도 {LMS_MAX_BYTES}B 초과, 접수 거부됨"
     return f"SMS {size}B" if size <= 90 else f"LMS {size}B"
 
 
@@ -73,6 +84,8 @@ def plan(cfg: InviteConfig, recipients: list[Recipient], store: Store, period: s
             state, attempts, error = PENDING, 0, ""
         elif record.status == SENT:
             state, attempts, error = DONE, record.attempts, ""
+        elif record.status == UNKNOWN:
+            state, attempts, error = UNKNOWN_STATE, record.attempts, record.error
         elif record.attempts >= cfg.max_attempts:
             state, attempts, error = GAVE_UP, record.attempts, record.error
         else:
@@ -95,6 +108,7 @@ class Report:
     failed: list[tuple[str, str]] = field(default_factory=list)
     already: int = 0
     gave_up: list[str] = field(default_factory=list)
+    unknown: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         lines = [
@@ -104,6 +118,8 @@ class Report:
         if self.failed:
             lines.append(f"⚠️ 실패 {len(self.failed)}명 (다음 실행에서 재시도)")
             lines += [f"  - {name}: {error[:80]}" for name, error in self.failed]
+        if self.unknown:
+            lines.append(f"❓ 전송 여부 불명 {len(self.unknown)}명 (자동 재시도 안 함 — 솔라피 콘솔 확인 후 필요하면 reset): {', '.join(self.unknown)}")
         if self.gave_up:
             lines.append(f"⛔ 재시도 한도 초과 {len(self.gave_up)}명: {', '.join(self.gave_up)}")
         return "\n".join(lines)
@@ -129,6 +145,9 @@ def run(
         if item.state == GAVE_UP:
             report.gave_up.append(recipient.name)
             continue
+        if item.state == UNKNOWN_STATE:
+            report.unknown.append(recipient.name)
+            continue
 
         if dry_run:
             log.info("[dry-run] %s %s via %s", recipient.name, recipient.masked_phone, recipient.channel)
@@ -149,13 +168,17 @@ def run(
             message_id = channel.send(recipient, item.text, item.variables)
         except ChannelError as exc:
             log.warning("발송 실패 %s %s: %s", recipient.name, recipient.masked_phone, exc)
-            store.record(period, recipient.phone, recipient.name, recipient.channel, ok=False, error=str(exc))
-            report.failed.append((recipient.name, str(exc)))
+            store.record(period, recipient.phone, recipient.name, recipient.channel, ok=False, error=str(exc), ambiguous=exc.ambiguous)
+            if exc.ambiguous:
+                report.unknown.append(recipient.name)
+            else:
+                report.failed.append((recipient.name, str(exc)))
             continue
         except Exception as exc:  # noqa: BLE001 - 한 사람 실패로 나머지를 멈추지 않는다
+            # 어디서 터졌는지 모르므로 나갔을 수도 있다고 본다.
             log.exception("예상치 못한 오류 %s", recipient.name)
-            store.record(period, recipient.phone, recipient.name, recipient.channel, ok=False, error=repr(exc))
-            report.failed.append((recipient.name, repr(exc)))
+            store.record(period, recipient.phone, recipient.name, recipient.channel, ok=False, error=repr(exc), ambiguous=True)
+            report.unknown.append(recipient.name)
             continue
 
         store.record(period, recipient.phone, recipient.name, recipient.channel, ok=True, message_id=message_id)

@@ -7,6 +7,7 @@
   python3 invite.py send               # 크론용. 발송일 전·미승인이면 아무것도 안 보냄
   python3 invite.py send --dry-run     # 대상만 출력
   python3 invite.py status             # 이번 달 누가 받았고 누가 실패했는지
+  python3 invite.py solapi-check       # 솔라피 잔액·알림톡 템플릿 승인/변수 점검 (발송 안 함)
   python3 invite.py reset --phone ...  # 특정인 기록을 지워 재발송 가능하게
   python3 invite.py telegram-link      # 텔레그램 수신자 번호 연결 대기 (상시 실행)
 """
@@ -14,11 +15,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import logging
 import re
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 from familyinvite import channels as channels_module
 from familyinvite import config as config_module
@@ -73,6 +77,22 @@ def _build_channels(cfg: InviteConfig, recipients: list[Recipient], store: Store
     return built
 
 
+@contextlib.contextmanager
+def _single_instance(db_path: str):
+    """send 가 동시에 두 개 돌면 같은 사람에게 두 통이 나갈 수 있다 (둘 다 '아직 안 보냄'을 읽음).
+    크론 중복·수동 실행 겹침을 파일 잠금으로 막는다."""
+    lock_path = Path(db_path).with_suffix(".lock")
+    with open(lock_path, "w") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ConfigError(f"다른 send 가 실행 중입니다 ({lock_path}). 끝난 뒤 다시 실행하세요.") from None
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def _notify_owner(cfg: InviteConfig, text: str) -> None:
     """운영자에게 텔레그램으로 알린다. 설정이 없으면 로그로만 남긴다."""
     token = (cfg.channels.get("telegram") or {}).get("bot_token", "")
@@ -98,12 +118,17 @@ def cmd_check(args: argparse.Namespace) -> int:
         print("-" * 60)
         for item in runner.plan(cfg, recipients, store, period):
             r = item.recipient
-            if r.channel == "telegram" and (cfg.channels.get("telegram") or {}).get("provider", "telegram") == "telegram":
-                note = "연결됨" if store.telegram_chat_id(r.phone) else "⚠️ 미연결 (telegram-link 필요)"
-            elif r.channel == "sms":
+            provider = str((cfg.channels.get(r.channel) or {}).get("provider", "telegram" if r.channel == "telegram" else "console"))
+            if r.channel == "sms":
                 note = runner.message_kind(item.text)
+            elif provider == "console":
+                note = ""
+            elif r.channel == "telegram":
+                note = "연결됨" if store.telegram_chat_id(r.phone) else "⚠️ 미연결 (telegram-link 필요)"
             else:
                 note = "알림톡 템플릿"
+            if provider == "console":
+                note = f"{note} · console(화면 출력만)".lstrip(" ·")
             print(f"{r.name:<10} {r.masked_phone:<14} {r.channel:<9} {note}")
         print(f"\n총 {len(recipients)}명 — 설정 OK\n")
     finally:
@@ -117,7 +142,7 @@ def cmd_preview(args: argparse.Namespace) -> int:
         period = _period(args, cfg)
         for item in runner.plan(cfg, recipients, store, period):
             r = item.recipient
-            state = {"done": "이미 발송", "gave_up": "재시도 한도 초과", "pending": "발송 예정"}[item.state]
+            state = {"done": "이미 발송", "gave_up": "재시도 한도 초과", "pending": "발송 예정", "unknown": "전송 여부 불명"}[item.state]
             print(f"── {r.name} {r.masked_phone} [{r.channel}] {state}")
             if r.channel == "kakao":
                 variables = (cfg.channels.get("kakao") or {}).get("variables") or {}
@@ -144,42 +169,47 @@ def cmd_approve(args: argparse.Namespace) -> int:
 def cmd_send(args: argparse.Namespace) -> int:
     cfg, recipients, store = _load(args)
     try:
-        now = _now(cfg)
-        period = _period(args, cfg)
-        if not args.period and not args.now and not runner.is_due(cfg, now):
-            log.info("아직 발송일 전입니다 (매월 %d일 %d시). 종료.", cfg.send_day, cfg.send_hour)
-            return 0
-
-        planned = runner.plan(cfg, recipients, store, period)
-        pending = [p for p in planned if p.state == runner.PENDING]
-        if not pending:
-            log.info("%s 발송할 사람이 없습니다 (전원 발송 완료 또는 재시도 한도 초과).", period)
-            return 0
-
-        if cfg.approval_required and not store.is_approved(period) and not args.dry_run:
-            if not store.was_notified(period):
-                names = ", ".join(p.recipient.name for p in pending)
-                _notify_owner(
-                    cfg,
-                    f"🔔 {period} 발송 승인 대기\n대상 {len(pending)}명: {names}\n\n"
-                    f"미리보기: python3 invite.py preview --period {period}\n"
-                    f"승인:     python3 invite.py approve --period {period}",
-                )
-                store.mark_notified(period)
-            log.info("%s 은 아직 승인되지 않았습니다. `invite.py approve --period %s` 후 다음 실행에서 발송됩니다.", period, period)
-            return 0
-
-        channels = {} if args.dry_run else _build_channels(cfg, recipients, store)
-        report = runner.run(planned, channels, store, period, gap_seconds=cfg.send_gap_seconds, dry_run=args.dry_run)
-        if args.dry_run:
-            print(f"[dry-run] {period} 발송 대상 {len(pending)}명 — 실제로는 보내지 않았습니다.")
-            return 0
-        print(report.summary())
-        if report.sent or report.failed:
-            _notify_owner(cfg, report.summary())
-        return 1 if report.failed and not report.sent else 0
+        with _single_instance(cfg.db_path):
+            return _send(args, cfg, recipients, store)
     finally:
         store.close()
+
+
+def _send(args: argparse.Namespace, cfg: InviteConfig, recipients: list[Recipient], store: Store) -> int:
+    now = _now(cfg)
+    period = _period(args, cfg)
+    if not args.period and not args.now and not runner.is_due(cfg, now):
+        log.info("아직 발송일 전입니다 (매월 %d일 %d시). 종료.", cfg.send_day, cfg.send_hour)
+        return 0
+
+    planned = runner.plan(cfg, recipients, store, period)
+    pending = [p for p in planned if p.state == runner.PENDING]
+    if not pending:
+        log.info("%s 발송할 사람이 없습니다 (전원 발송 완료 또는 재시도 한도 초과).", period)
+        return 0
+
+    if cfg.approval_required and not store.is_approved(period) and not args.dry_run:
+        if not store.was_notified(period):
+            names = ", ".join(p.recipient.name for p in pending)
+            _notify_owner(
+                cfg,
+                f"🔔 {period} 발송 승인 대기\n대상 {len(pending)}명: {names}\n\n"
+                f"미리보기: python3 invite.py preview --period {period}\n"
+                f"승인:     python3 invite.py approve --period {period}",
+            )
+            store.mark_notified(period)
+        log.info("%s 은 아직 승인되지 않았습니다. `invite.py approve --period %s` 후 다음 실행에서 발송됩니다.", period, period)
+        return 0
+
+    channels = {} if args.dry_run else _build_channels(cfg, recipients, store)
+    report = runner.run(planned, channels, store, period, gap_seconds=cfg.send_gap_seconds, dry_run=args.dry_run)
+    if args.dry_run:
+        print(f"[dry-run] {period} 발송 대상 {len(pending)}명 — 실제로는 보내지 않았습니다.")
+        return 0
+    print(report.summary())
+    if report.sent or report.failed or report.unknown:
+        _notify_owner(cfg, report.summary())
+    return 1 if (report.failed or report.unknown) and not report.sent else 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -187,7 +217,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     try:
         period = _period(args, cfg)
         print(f"\n{period} · 승인 {'✅' if store.is_approved(period) else '⏳ 대기'}")
-        labels = {"done": "✅ 발송", "pending": "⏳ 대기", "gave_up": "⛔ 포기"}
+        labels = {"done": "✅ 발송", "pending": "⏳ 대기", "gave_up": "⛔ 포기", "unknown": "❓ 불명"}
         for item in runner.plan(cfg, recipients, store, period):
             r = item.recipient
             label = labels[item.state] if not (item.state == "pending" and item.attempts) else f"⚠️ 실패 {item.attempts}회"
@@ -211,6 +241,43 @@ def cmd_reset(args: argparse.Namespace) -> int:
     finally:
         store.close()
     return 0
+
+
+def cmd_solapi_check(args: argparse.Namespace) -> int:
+    """실제 솔라피 계정에 조회 요청만 보내 발송 준비 상태를 점검한다 (문자는 안 나간다)."""
+    cfg, recipients, store = _load(args)
+    store.close()
+    used = {r.channel for r in recipients}
+    solapi = {name: cfg.channels[name] for name in ("sms", "kakao")
+              if name in used and str((cfg.channels.get(name) or {}).get("provider", "")).lower() == "solapi"}
+    if not solapi:
+        print("명단에서 솔라피를 쓰는 경로(sms/kakao, provider=solapi)가 없습니다.")
+        return 0
+
+    problems = 0
+    inspector = channels_module.SolapiInspector(next(iter(solapi.values())))
+    balance, point = inspector.balance()
+    counts = {name: sum(1 for r in recipients if r.channel == name) for name in solapi}
+    print(f"💰 잔액 {balance:,.0f}원 · 포인트 {point:,.0f}")
+    print("   대상: " + ", ".join(f"{name} {count}명" for name, count in counts.items()))
+    if balance + point <= 0:
+        print("   ⚠️ 잔액이 0 입니다 — 충전하지 않으면 전원 접수 거부됩니다.")
+        problems += 1
+
+    kakao = solapi.get("kakao")
+    if kakao:
+        template_id = str(kakao.get("template_id", ""))
+        template = inspector.template(template_id)
+        print(f"\n📄 알림톡 템플릿 {template_id} · 상태 {template.get('status')} · 이름 {template.get('name', '')}")
+        if template.get("content"):
+            print("   " + str(template["content"]).replace("\n", "\n   "))
+        issues = channels_module.check_alimtalk_template(template, dict(kakao.get("variables") or {}), str(kakao.get("pf_id", "")))
+        for issue in issues:
+            print(f"   ⚠️ {issue}")
+        problems += len(issues)
+
+    print("\n✅ 발송 준비 완료" if not problems else f"\n⚠️ 문제 {problems}건 — 위 내용을 고친 뒤 다시 점검하세요")
+    return 1 if problems else 0
 
 
 def cmd_telegram_link(args: argparse.Namespace) -> int:
@@ -253,7 +320,7 @@ def build_parser() -> argparse.ArgumentParser:
     with_period(sub.add_parser("approve", help="그달 발송 승인")).set_defaults(func=cmd_approve)
     with_period(sub.add_parser("status", help="그달 발송 현황")).set_defaults(func=cmd_status)
 
-    send = with_period(sub.add_parser("send", help="발송 (크론용)"))
+    send = with_period(sub.add_parser("send", help="발송 (크론용). --period 를 직접 주면 발송일 검사를 건너뛴다"))
     send.add_argument("--now", action="store_true", help="발송일 검사를 건너뛴다 (승인은 여전히 필요)")
     send.add_argument("--dry-run", action="store_true")
     send.set_defaults(func=cmd_send)
@@ -262,6 +329,8 @@ def build_parser() -> argparse.ArgumentParser:
     reset.add_argument("--phone", default="")
     reset.add_argument("--all", action="store_true")
     reset.set_defaults(func=cmd_reset)
+
+    sub.add_parser("solapi-check", help="솔라피 잔액·알림톡 템플릿 점검 (발송 안 함)").set_defaults(func=cmd_solapi_check)
 
     link = sub.add_parser("telegram-link", help="텔레그램 수신자 번호 연결 대기")
     link.add_argument("--once", action="store_true", help="한 번만 확인하고 종료")
