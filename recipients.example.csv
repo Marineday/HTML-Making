@@ -1,0 +1,6 @@
+name,phone,channel,link,active,memo
+홍길동,010-1234-5678,sms,,y,
+김철수,+82 10 2345 6789,kakao,,y,
+이영희,01034567890,telegram,,y,
+박민수,010-4567-8901,,https://example.com/personal-link,y,개인 링크 예시
+최지우,010-5678-9012,sms,,n,잠시 중지 예시

@@ -14,3 +14,7 @@ venv/
 # logs
 *.log
 logs/
+
+# familyinvite: 전화번호 명단과 설정은 커밋 금지
+invite.json
+recipients.csv
