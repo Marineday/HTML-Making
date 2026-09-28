@@ -1,0 +1,71 @@
+// 매월 링크 자동 발송 설정 예시
+// ------------------------------------------------------------------
+// 1) 이 파일을 invite.json 으로, recipients.example.csv 를 recipients.csv 로 복사
+//    (둘 다 .gitignore 됨 — 전화번호 목록은 절대 커밋하지 말 것)
+// 2) 토큰·키는 여기 적지 말고 ${ENV_VAR} 로 참조
+// 3) python3 invite.py check → preview → approve → send --now 순서로 시험
+{
+  "recipients_path": "recipients.csv",
+  "db_path": "invite.db",
+  "timezone": "Asia/Seoul",
+
+  // 매월 1일 10시 이후 첫 `send` 실행에서 발송. 크론은 매일 돌려도 된다.
+  "send_day": 1,
+  "send_hour": 10,
+
+  // 공통 링크. 명단의 link 열이 있으면 그 사람에게는 그 링크가 나간다.
+  "link": "https://example.com/replace-me",
+
+  // 자리표시자: {name} {link} {link_noscheme} {month} {year} {memo}
+  // 문자는 EUC-KR 90바이트(한글 약 45자)를 넘으면 LMS 요금이 붙는다. check 로 확인.
+  "message": "[{month}월 초대] {name}님, 이번 달 링크입니다.\n{link}",
+
+  "default_channel": "sms",
+
+  // true: 매월 발송 전에 `invite.py approve` 를 해야 나간다 (사람 승인 게이트).
+  // 링크를 매달 바꿔야 하는 경우라면 켜두는 걸 권한다 — 지난달 링크가 나가는 사고 방지.
+  "approval_required": true,
+  "max_attempts": 3,
+  "send_gap_seconds": 1.0,
+
+  // 승인 요청과 발송 결과를 텔레그램으로 받는다 (channels.telegram.bot_token 필요).
+  // 내 chat_id 는 봇에게 아무 말이나 건 뒤 https://api.telegram.org/bot<토큰>/getUpdates 에서 확인.
+  "owner": { "telegram_chat_id": "" },
+
+  "channels": {
+    // 처음엔 console 로 두고 흐름을 확인한 뒤 solapi 로 바꾼다.
+    "sms": {
+      "provider": "console"
+      // "provider": "solapi",
+      // "api_key": "${SOLAPI_API_KEY}",
+      // "api_secret": "${SOLAPI_API_SECRET}",
+      // "from": "01000000000"            // 솔라피 콘솔에 사전등록한 발신번호
+    },
+
+    // 카카오 알림톡: 비즈니스 인증 채널 + 심사 통과 템플릿 필요. 본문은 템플릿 그대로 나가고
+    // message 는 쓰지 않는다. 템플릿 변수에 우리 자리표시자를 채운다.
+    "kakao": {
+      "provider": "console",
+      // "provider": "solapi",
+      // "api_key": "${SOLAPI_API_KEY}",
+      // "api_secret": "${SOLAPI_API_SECRET}",
+      // "from": "01000000000",
+      // "pf_id": "KA01PF...",             // 솔라피에 연동한 카카오 채널 ID
+      // "template_id": "KA01TP...",
+      // "sms_fallback": true,             // 카톡 실패 시 문자로 대체발송
+      // 템플릿 변수와 정확히 같아야 한다 (invite.py solapi-check 로 확인).
+      // 버튼 링크를 https://#{링크} 로 등록했다면 {link_noscheme} (https:// 뺀 링크)를 쓴다.
+      // 절차: docs/kakao-alimtalk.md  (⚠️ 비즈니스 인증 채널 = 사업자등록 필요)
+      "variables": { "#{이름}": "{name}", "#{월}": "{month}", "#{링크}": "{link_noscheme}" }
+    },
+
+    // 텔레그램: 수신자가 봇에 /start 후 번호를 공유해야 발송 가능 (invite.py telegram-link)
+    "telegram": {
+      "provider": "console"
+      // "provider": "telegram",
+      // "bot_token": "${TELEGRAM_BOT_TOKEN}"
+    }
+  },
+
+  "log_level": "INFO"
+}

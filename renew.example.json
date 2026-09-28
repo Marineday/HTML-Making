@@ -1,0 +1,45 @@
+// 구독 만료 관리 + 문자 안내 설정 예시
+// ------------------------------------------------------------------
+// 1) 이 파일을 renew.json 으로 복사 (.gitignore 됨)
+// 2) 비밀번호·API 키는 환경변수로:  export RENEW_ADMIN_PASSWORD='12자 이상'
+// 3) python3 renew.py serve → 브라우저에서 고객 등록 → python3 renew.py remind --dry-run
+{
+  "db_path": "renewal.db",
+  "timezone": "Asia/Seoul",
+
+  // 만료 며칠 전에 문자를 보낼지. [7, 1] = 7일 전과 1일 전. 0 = 만료 당일.
+  "reminder_days": [7, 1],
+  // 이 시각 이전에는 보내지 않는다 (크론이 새벽에 돌아도 안전)
+  "send_hour": 10,
+
+  // true: 매일 크론(renew.py remind)이 자동 발송
+  // false: 사이트의 [문자 안내] 화면에서 버튼으로만 발송 (사람 확인 후 발송)
+  "auto_send": true,
+  // 한 번에 이보다 많으면 아무것도 보내지 않고 멈춘다 (날짜 일괄 입력 실수 대비)
+  "max_per_run": 50,
+  "max_attempts": 3,
+  "send_gap_seconds": 1.0,
+
+  // 자리표시자: {name} {plan} {expires}(10월 5일) {dday}(D-7) {days}(7) {link} {contact}
+  // 한글 45자(90바이트) 넘으면 LMS 요금. 광고성 문구(할인·이벤트)를 넣으면 (광고) 표기 의무가 생긴다.
+  "message": "[이용 안내] {name}님, 이용 기간이 {expires}({dday})에 만료됩니다. 연장 문의: {contact}",
+  "link": "",
+  "contact": "010-0000-0000",
+
+  "sms": {
+    "provider": "console"
+    // "provider": "solapi",
+    // "api_key": "${SOLAPI_API_KEY}",
+    // "api_secret": "${SOLAPI_API_SECRET}",
+    // "from": "01000000000"           // 솔라피에 사전등록한 발신번호
+  },
+
+  "admin": {
+    "password": "${RENEW_ADMIN_PASSWORD}",
+    "host": "127.0.0.1",               // 외부 공개 시 HTTPS 리버스 프록시 뒤에 둘 것
+    "port": 8090
+    // "secret_key": "${RENEW_SECRET_KEY}"  // 지정하면 재시작해도 로그인 유지
+  },
+
+  "log_level": "INFO"
+}

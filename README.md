@@ -22,6 +22,10 @@
 | [docs/pricing.md](docs/pricing.md) | 단가 계산과 초특가 판정 |
 | [docs/toss-capture.md](docs/toss-capture.md) | 토스 앱에서 핫딜 수집 |
 | [docs/kakao-setup.md](docs/kakao-setup.md) | 카카오 오픈채팅 연결 |
+| [docs/renewal.md](docs/renewal.md) | 구독 만료 관리 사이트 + 만료 전 문자 자동 안내 (`renew.py`) |
+| [docs/family-invite.md](docs/family-invite.md) | 매월 링크 자동 발송 (`invite.py` — 문자·알림톡·텔레그램) |
+| [docs/solapi.md](docs/solapi.md) | 솔라피 API 분석 (공식 SDK 소스 기준) |
+| [docs/kakao-alimtalk.md](docs/kakao-alimtalk.md) | 카카오 알림톡 발송 준비 절차 |
 
 ---
 
