@@ -114,10 +114,14 @@ def from_dict(raw: dict[str, Any]) -> InviteConfig:
 
 def check_template(template: str, where: str) -> None:
     """모르는 자리표시자나 짝이 안 맞는 중괄호를 설정 로드 시점에 잡는다."""
+    check_template_fields(template, where, PLACEHOLDERS)
+
+
+def check_template_fields(template: str, where: str, allowed: tuple[str, ...]) -> None:
     try:
         fields = [name for _, name, _, _ in string.Formatter().parse(template) if name is not None]
     except ValueError as exc:
         raise ConfigError(f"{where} 템플릿의 중괄호가 잘못됐습니다: {exc}. 글자 그대로의 {{ 는 {{{{ 로 쓰세요.") from exc
     for name in fields:
-        if name not in PLACEHOLDERS:
-            raise ConfigError(f"{where} 템플릿의 {{{name}}} 는 쓸 수 없습니다. 가능한 것: {PLACEHOLDERS}")
+        if name not in allowed:
+            raise ConfigError(f"{where} 템플릿의 {{{name}}} 는 쓸 수 없습니다. 가능한 것: {allowed}")

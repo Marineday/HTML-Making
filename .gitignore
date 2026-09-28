@@ -19,3 +19,8 @@ logs/
 invite.json
 invite.lock
 recipients.csv
+
+# renewal: 고객 DB·설정 커밋 금지
+renew.json
+*.db-wal
+*.db-shm
